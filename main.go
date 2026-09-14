@@ -28,6 +28,8 @@ type Song struct {
 	Artista string `json:"artista"`
 }
 
+// ManifestEntry es lo que se guarda en R2 (_manifest/manifest.json) para no
+// tener que volver a extraer metadatos de un archivo que no ha cambiado.
 type ManifestEntry struct {
 	Nombre   string `json:"nombre"`
 	Titulo   string `json:"titulo"`
@@ -37,9 +39,12 @@ type ManifestEntry struct {
 }
 
 const (
-	// Tamaños de lectura optimizados para R2
-	headFetchSize int64 = 2 * 1024 * 1024 // 2MB para MP3/FLAC (inicio)
-	tailFetchSize int64 = 3 * 1024 * 1024 // 3MB para WAV (final - unificado para texto y carátula)
+	// Rango leído para MP3/FLAC (el tag/los bloques de metadatos van al principio)
+	headFetchSize int64 = 2 * 1024 * 1024 // 2MB
+	
+	// Rango leído para WAV (Serato/rekordbox/Traktor suelen meter el chunk id3
+	// DESPUÉS del audio, casi al final del archivo). Unificado para texto y carátula.
+	tailFetchSize int64 = 3 * 1024 * 1024 // 3MB
 
 	manifestKey       = "_manifest/manifest.json"
 	coverPrefix       = "_manifest/covers/"
@@ -59,6 +64,10 @@ var (
 
 	reconcileMutex sync.Mutex
 )
+
+// ==========================================
+// CONFIGURACIÓN E INICIALIZACIÓN S3 / R2
+// ==========================================
 
 func initS3() {
 	bucketName = os.Getenv("R2_BUCKET_NAME")
@@ -102,6 +111,10 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 		next(w, r)
 	}
 }
+
+// ==========================================
+// UTILIDADES DE LECTURA PARCIAL CONTRA R2
+// ==========================================
 
 func fetchRange(ctx context.Context, key string, rangeHeader string) ([]byte, error) {
 	input := &s3.GetObjectInput{
@@ -150,7 +163,9 @@ func listAllObjects(ctx context.Context) ([]types.Object, error) {
 	return all, nil
 }
 
-// --- Extracción de metadatos ID3 / FLAC ---
+// ==========================================
+// EXTRACCIÓN DE METADATOS ID3 / FLAC
+// ==========================================
 
 func findID3Signature(data []byte) int {
 	search := []byte("ID3")
@@ -319,7 +334,9 @@ func coverKeyFor(name, mime string) string {
 	return coverPrefix + safe + ext
 }
 
-// --- Manifiesto persistido en R2 ---
+// ==========================================
+// MANIFIESTO PERSISTIDO EN R2
+// ==========================================
 
 func loadManifest(ctx context.Context) map[string]ManifestEntry {
 	manifest := map[string]ManifestEntry{}
@@ -463,6 +480,10 @@ func reconcileLibrary(ctx context.Context) {
 	}
 }
 
+// ==========================================
+// ENDPOINTS HTTP Y CONTROLADORES
+// ==========================================
+
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -592,6 +613,10 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", mime)
 	w.Write(pic)
 }
+
+// ==========================================
+// FUNCIÓN PRINCIPAL (MAIN)
+// ==========================================
 
 func main() {
 	initS3()
