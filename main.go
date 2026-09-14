@@ -71,7 +71,7 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // getSongs lista los archivos de la nube y extrae metadatos descargando una pequeña porción inicial del archivo
-// getSongs lista archivos y extrae metadatos para MP3, WAV y FLAC
+// getSongs lista archivos y extrae metadatos para MP3, WAV y FLAC desde R2
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -91,7 +91,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		name := aws.ToString(obj.Key)
 		ext := strings.ToLower(filepath.Ext(name))
 		
-		// Omitir archivos temporales de subida si se ven en el listado
+		// Omitir archivos temporales de subida Multipart
 		if strings.Contains(name, "Multipart") || (ext != ".mp3" && ext != ".flac" && ext != ".wav") {
 			continue
 		}
@@ -99,21 +99,16 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		// Tanto MP3 como WAV (etiquetados con Mp3tag usando RIFF/ID3) leen sus metadatos con id3v2
-		if ext == ".mp3" || ext == ".wav" {
+		// 1. Extraer metadatos para MP3 (descargando los primeros 128 KB)
+		if ext == ".mp3" {
 			rangeInput := &s3.GetObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(name),
-				Range:  aws.String("bytes=0-131071"), // Bajamos solo los primeros KB para leer el encabezado de etiquetas
+				Range:  aws.String("bytes=0-131071"),
 			}
 			res, err := s3Client.GetObject(context.TODO(), rangeInput)
 			if err == nil {
-				prefix := "meta-*.mp3"
-				if ext == ".wav" {
-					prefix = "meta-*.wav"
-				}
-
-				tmpFile, err := os.CreateTemp("", prefix)
+				tmpFile, err := os.CreateTemp("", "meta-*.mp3")
 				if err == nil {
 					tmpName := tmpFile.Name()
 					io.Copy(tmpFile, res.Body)
@@ -130,6 +125,58 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 							artist = a
 						}
 						tag.Close()
+					}
+				}
+			}
+		}
+
+		// 2. Extraer metadatos para WAV (descargamos 2 MB para asegurar capturar el bloque RIFF/ID3 completo de Mp3tag)
+		if ext == ".wav" {
+			rangeInput := &s3.GetObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(name),
+				Range:  aws.String("bytes=0-2097152"), // 2 MB para asegurar el bloque ID3 dentro del RIFF
+			}
+			res, err := s3Client.GetObject(context.TODO(), rangeInput)
+			if err == nil {
+				data, err := io.ReadAll(res.Body)
+				res.Body.Close()
+
+				if err == nil && len(data) > 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WAVE" {
+					offset := 12
+					for offset < len(data)-8 {
+						chunkID := string(data[offset : offset+4])
+						chunkSize := int(data[offset+4]) | int(data[offset+5])<<8 | int(data[offset+6])<<16 | int(data[offset+7])<<24
+
+						if chunkID == "ID3 " || chunkID == "id3 " {
+							if offset+8+chunkSize <= len(data) {
+								tagData := data[offset+8 : offset+8+chunkSize]
+								tmpFile, err := os.CreateTemp("", "wav-id3-*.tmp")
+								if err == nil {
+									tmpName := tmpFile.Name()
+									tmpFile.Write(tagData)
+									tmpFile.Close()
+									defer os.Remove(tmpName)
+
+									tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
+									if err == nil {
+										if t := tag.Title(); t != "" {
+											title = t
+										}
+										if a := tag.Artist(); a != "" {
+											artist = a
+										}
+										tag.Close()
+									}
+								}
+							}
+							break
+						}
+
+						offset += 8 + chunkSize
+						if chunkSize%2 != 0 {
+							offset++
+						}
 					}
 				}
 			}
