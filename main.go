@@ -40,7 +40,7 @@ type ManifestEntry struct {
 
 const (
 	// Rango leído para MP3/FLAC (el tag/los bloques de metadatos van al principio)
-	headFetchSize int64 = 2 * 1024 * 1024 // 2MB
+	headFetchSize int64 = 3 * 1024 * 1024 // 2MB
 	
 	// Rango leído para WAV (Serato/rekordbox/Traktor suelen meter el chunk id3
 	// DESPUÉS del audio, casi al final del archivo). Unificado para texto y carátula.
