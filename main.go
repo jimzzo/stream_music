@@ -34,7 +34,7 @@ func initS3() {
 	secretKey := os.Getenv("R2_SECRET_ACCESS_KEY")
 
 	if accountID == "" || bucketName == "" {
-		log.Println("Aviso: Variables de entorno de R2 no configuradas. El servidor funcionará en modo local o fallará si se requiere la nube.")
+		log.Println("Aviso: Variables de entorno de R2 no configuradas.")
 		return
 	}
 
@@ -70,7 +70,7 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// getSongs ahora lista automáticamente los archivos directamente desde la nube de Cloudflare R2
+// getSongs lista los archivos de la nube y extrae metadatos descargando una pequeña porción inicial del archivo
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -96,7 +96,37 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		// Opcional: Si quieres extraer metadatos descargando temporalmente los primeros KB del archivo en la nube
+		// Si es MP3, podemos leer metadatos descargando los primeros 128KB del archivo desde R2 de forma eficiente
+		if ext == ".mp3" {
+			rangeInput := &s3.GetObjectInput{
+				Bucket: aws.String(bucketName),
+				Key:    aws.String(name),
+				Range:  aws.String("bytes=0-131071"), // Primeros 128 KB
+			}
+			res, err := s3Client.GetObject(context.TODO(), rangeInput)
+			if err == nil {
+				tmpFile, err := os.CreateTemp("", "meta-*.mp3")
+				if err == nil {
+					tmpName := tmpFile.Name()
+					io.Copy(tmpFile, res.Body)
+					tmpFile.Close()
+					res.Body.Close()
+					defer os.Remove(tmpName)
+
+					tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
+					if err == nil {
+						if t := tag.Title(); t != "" {
+							title = t
+						}
+						if a := tag.Artist(); a != "" {
+							artist = a
+						}
+						tag.Close()
+					}
+				}
+			}
+		}
+
 		songs = append(songs, Song{
 			Nombre:  name,
 			Titulo:  title,
@@ -108,7 +138,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(songs)
 }
 
-// playSong transmite las canciones de la nube soportando Range Requests para sesiones de 2 horas
+// playSong transmite las canciones de la nube con soporte de Range Requests
 func playSong(w http.ResponseWriter, r *http.Request) {
 	songName := r.URL.Query().Get("song")
 	if s3Client == nil {
@@ -121,7 +151,6 @@ func playSong(w http.ResponseWriter, r *http.Request) {
 		Key:    aws.String(songName),
 	}
 
-	// Manejo de peticiones de rango enviadas por el navegador para saltar en archivos pesados
 	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
 		input.Range = aws.String(rangeHeader)
 	}
@@ -150,7 +179,46 @@ func playSong(w http.ResponseWriter, r *http.Request) {
 }
 
 func getCover(w http.ResponseWriter, r *http.Request) {
-	// Aquí puedes implementar la lectura de la carátula directo desde R2 si lo deseas
+	songName := r.URL.Query().Get("song")
+	ext := strings.ToLower(filepath.Ext(songName))
+	if s3Client == nil {
+		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
+		return
+	}
+
+	// Descargamos una porción inicial para buscar la carátula integrada en el MP3
+	if ext == ".mp3" {
+		rangeInput := &s3.GetObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    aws.String(songName),
+			Range:  aws.String("bytes=0-524288"), // Primeros 512 KB donde suele estar la carátula
+		}
+		res, err := s3Client.GetObject(context.TODO(), rangeInput)
+		if err == nil {
+			tmpFile, err := os.CreateTemp("", "cover-*.mp3")
+			if err == nil {
+				tmpName := tmpFile.Name()
+				io.Copy(tmpFile, res.Body)
+				tmpFile.Close()
+				res.Body.Close()
+				defer os.Remove(tmpName)
+
+				tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
+				if err == nil {
+					defer tag.Close()
+					pictures := tag.GetFrames(tag.CommonID("Attached picture"))
+					for _, f := range pictures {
+						if pic, ok := f.(id3v2.PictureFrame); ok {
+							w.Header().Set("Content-Type", pic.MimeType)
+							w.Write(pic.Picture)
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+
 	http.Error(w, "No cover found", http.StatusNotFound)
 }
 
