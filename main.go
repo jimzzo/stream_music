@@ -28,8 +28,6 @@ type Song struct {
 	Artista string `json:"artista"`
 }
 
-// ManifestEntry es lo que se guarda en R2 (_manifest/manifest.json) para no
-// tener que volver a extraer metadatos de un archivo que no ha cambiado.
 type ManifestEntry struct {
 	Nombre   string `json:"nombre"`
 	Titulo   string `json:"titulo"`
@@ -39,18 +37,12 @@ type ManifestEntry struct {
 }
 
 const (
-	// Rango leído para MP3/FLAC (el tag/los bloques de metadatos van al principio)
-	headFetchSize int64 = 2 * 1024 * 1024 // 2MB
-	// Rango leído para WAV (Serato/rekordbox/Traktor suelen meter el chunk id3
-	// DESPUÉS del audio, casi al final del archivo)
-	tailFetchSize int64 = 3 * 1024 * 1024 // 3MB
-	// Rango ligero usado solo para leer título/artista (más barato que el de carátula)
-	scanHeadSize int64 = 512 * 1024
-	scanTailSize int64 = 512 * 1024
+	// Tamaños de lectura optimizados para R2
+	headFetchSize int64 = 2 * 1024 * 1024 // 2MB para MP3/FLAC (inicio)
+	tailFetchSize int64 = 3 * 1024 * 1024 // 3MB para WAV (final - unificado para texto y carátula)
 
-	manifestKey = "_manifest/manifest.json"
-	coverPrefix = "_manifest/covers/"
-
+	manifestKey       = "_manifest/manifest.json"
+	coverPrefix       = "_manifest/covers/"
 	reconcileInterval = 10 * time.Minute
 )
 
@@ -111,8 +103,6 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// --- Utilidades de lectura/escritura parcial contra R2/S3 ---
-
 func fetchRange(ctx context.Context, key string, rangeHeader string) ([]byte, error) {
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
@@ -162,9 +152,6 @@ func listAllObjects(ctx context.Context) ([]types.Object, error) {
 
 // --- Extracción de metadatos ID3 / FLAC ---
 
-// findID3Signature busca la firma real de un tag ID3v2 ("ID3" + byte de
-// versión 2/3/4) dentro de un buffer de bytes. No depende de que el chunk
-// "id3 " de WAV esté bien alineado: busca el tag ID3v2 en sí, esté donde esté.
 func findID3Signature(data []byte) int {
 	search := []byte("ID3")
 	start := 0
@@ -218,8 +205,6 @@ func extractPictureFromID3Bytes(data []byte) (mime string, pic []byte) {
 	return "", nil
 }
 
-// extractFlacPictureFromBytes recorre los METADATA BLOCKs de un FLAC (van al
-// principio del archivo, antes del audio) buscando el bloque PICTURE (tipo 6).
 func extractFlacPictureFromBytes(data []byte) (mime string, pic []byte) {
 	if len(data) < 4 || string(data[:4]) != "fLaC" {
 		return "", nil
@@ -263,26 +248,10 @@ func extractTitleArtist(ctx context.Context, name, ext string, size int64) (titl
 	title = strings.TrimSuffix(name, ext)
 	artist = "Cloud Library"
 
-	head, err := fetchRange(ctx, name, fmt.Sprintf("bytes=0-%d", scanHeadSize-1))
-	if err == nil {
-		if t, a, ok := parseID3TitleArtist(head); ok {
-			if t != "" {
-				title = t
-			}
-			if a != "" {
-				artist = a
-			}
-			return
-		}
-	}
-
-	if ext == ".wav" && size > 0 {
-		start := size - scanTailSize
-		if start < 0 {
-			start = 0
-		}
-		if tail, terr := fetchRange(ctx, name, fmt.Sprintf("bytes=%d-%d", start, size-1)); terr == nil {
-			if t, a, ok := parseID3TitleArtist(tail); ok {
+	switch ext {
+	case ".mp3", ".flac":
+		if head, err := fetchRange(ctx, name, fmt.Sprintf("bytes=0-%d", headFetchSize-1)); err == nil {
+			if t, a, ok := parseID3TitleArtist(head); ok {
 				if t != "" {
 					title = t
 				}
@@ -291,8 +260,24 @@ func extractTitleArtist(ctx context.Context, name, ext string, size int64) (titl
 				}
 			}
 		}
+	case ".wav":
+		if size > 0 {
+			start := size - tailFetchSize
+			if start < 0 {
+				start = 0
+			}
+			if tail, err := fetchRange(ctx, name, fmt.Sprintf("bytes=%d-%d", start, size-1)); err == nil {
+				if t, a, ok := parseID3TitleArtist(tail); ok {
+					if t != "" {
+						title = t
+					}
+					if a != "" {
+						artist = a
+					}
+				}
+			}
+		}
 	}
-
 	return
 }
 
@@ -343,7 +328,7 @@ func loadManifest(ctx context.Context) map[string]ManifestEntry {
 		Key:    aws.String(manifestKey),
 	})
 	if err != nil {
-		return manifest // no existe todavía (primer arranque) o error de red: empezamos de cero
+		return manifest
 	}
 	defer res.Body.Close()
 	data, err := io.ReadAll(res.Body)
@@ -390,11 +375,6 @@ func persistManifestAsync() {
 	}
 }
 
-// reconcileLibrary compara el bucket con el manifest guardado en R2 y solo
-// procesa (extrae metadatos/carátula) los archivos nuevos o modificados,
-// detectando cambios por ETag. Completamente automático: se llama sola al
-// arrancar, cada reconcileInterval en segundo plano, y de forma perezosa la
-// primera vez que alguien pide /songs.
 func reconcileLibrary(ctx context.Context) {
 	reconcileMutex.Lock()
 	defer reconcileMutex.Unlock()
@@ -433,7 +413,6 @@ func reconcileLibrary(ctx context.Context) {
 			continue
 		}
 
-		// Archivo nuevo o modificado desde la última reconciliación: procesarlo.
 		changed = true
 		title, artist := extractTitleArtist(ctx, name, ext, size)
 		mime, pic := extractCoverBytes(ctx, name, ext, size)
@@ -456,8 +435,6 @@ func reconcileLibrary(ctx context.Context) {
 		songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 	}
 
-	// Limpieza: canciones que ya no están en el bucket (borradas) pierden su
-	// carátula huérfana y su entrada en el manifest.
 	for key, old := range oldManifest {
 		if _, ok := newManifest[key]; !ok {
 			changed = true
@@ -497,9 +474,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	cacheMutex.Unlock()
 
 	if !loaded {
-		// Primera vez desde que arrancó el servidor: reconcilia ya mismo para
-		// poder responder con datos completos (las siguientes veces esto ya
-		// está resuelto por el ticker en segundo plano).
 		reconcileLibrary(r.Context())
 	}
 
@@ -566,10 +540,6 @@ func serveObject(ctx context.Context, w http.ResponseWriter, key string) bool {
 	return true
 }
 
-// getCover sirve la carátula ya indexada en el manifest (una simple lectura
-// de un archivo de imagen pequeño en R2, sin tocar el audio). Si la canción
-// es tan nueva que todavía no pasó por reconcileLibrary, la extrae al vuelo
-// y la dejar registrada para que la próxima petición ya sea instantánea.
 func getCover(w http.ResponseWriter, r *http.Request) {
 	songName := r.URL.Query().Get("song")
 	if s3Client == nil {
@@ -590,7 +560,6 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		if serveObject(ctx, w, entry.CoverKey) {
 			return
 		}
-		// La carátula desapareció de R2 por algún motivo: seguimos al fallback.
 	}
 
 	ext := strings.ToLower(filepath.Ext(songName))
@@ -628,8 +597,6 @@ func main() {
 	initS3()
 
 	if s3Client != nil {
-		// Reconciliación inicial en segundo plano (no bloquea el arranque del
-		// servidor) y refresco periódico automático, sin intervención manual.
 		go reconcileLibrary(context.Background())
 		go func() {
 			ticker := time.NewTicker(reconcileInterval)
