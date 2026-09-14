@@ -96,9 +96,9 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		log.Printf("[DEBUG] Analizando archivo completo en R2: '%s'", name)
+		log.Printf("[DEBUG] Descargando y analizando archivo completo: '%s'", name)
 
-		// Descargamos el objeto completo (tal como lo hacías en local) para asegurar lectura íntegra de metadatos
+		// Descargamos el objeto COMPLETO de R2 (exactamente como en local para respetar el formato RIFF ID3v2.3)
 		res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(name),
@@ -109,21 +109,21 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		data, err := io.ReadAll(res.Body)
-		res.Body.Close()
+		// Usamos un archivo temporal y hacemos streaming a disco con io.Copy 
+		// (cero uso de RAM, evitando el error de Out Of Memory en Render)
+		tmpFile, err := os.CreateTemp("", "meta-*.tmp")
 		if err != nil {
+			res.Body.Close()
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
 
-		// Creamos archivo temporal con el contenido completo para el lector ID3
-		tmpFile, err := os.CreateTemp("", "meta-*.tmp")
-		if err == nil {
-			tmpName := tmpFile.Name()
-			tmpFile.Write(data)
-			tmpFile.Close()
-			defer os.Remove(tmpName)
+		tmpName := tmpFile.Name()
+		_, copyErr := io.Copy(tmpFile, res.Body)
+		res.Body.Close()
+		tmpFile.Close()
 
+		if copyErr == nil {
 			tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
 			if err == nil {
 				defer tag.Close()
@@ -140,6 +140,8 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[ID3V2 WARN] id3v2.Open falló para %s: %v", name, err)
 			}
 		}
+
+		os.Remove(tmpName)
 
 		songs = append(songs, Song{
 			Nombre:  name,
@@ -209,55 +211,57 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 	}
 	defer res.Body.Close()
 
-	data, err := io.ReadAll(res.Body)
+	tmpFile, err := os.CreateTemp("", "cover-*.tmp")
 	if err != nil {
+		http.Error(w, "No cover found", http.StatusInternalServerError)
+		return
+	}
+	tmpName := tmpFile.Name()
+	_, copyErr := io.Copy(tmpFile, res.Body)
+	tmpFile.Close()
+	defer os.Remove(tmpName)
+
+	if copyErr != nil {
 		http.Error(w, "No cover found", http.StatusNotFound)
 		return
 	}
 
 	if ext == ".mp3" || ext == ".wav" {
-		tmpFile, err := os.CreateTemp("", "cover-*.tmp")
+		tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
 		if err == nil {
-			tmpName := tmpFile.Name()
-			tmpFile.Write(data)
-			tmpFile.Close()
-			defer os.Remove(tmpName)
-
-			tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
-			if err == nil {
-				defer tag.Close()
-				pictures := tag.GetFrames(tag.CommonID("Attached picture"))
-				for _, f := range pictures {
-					if pic, ok := f.(id3v2.PictureFrame); ok {
-						w.Header().Set("Content-Type", pic.MimeType)
-						w.Write(pic.Picture)
-						return
-					}
+			defer tag.Close()
+			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
+			for _, f := range pictures {
+				if pic, ok := f.(id3v2.PictureFrame); ok {
+					w.Header().Set("Content-Type", pic.MimeType)
+					w.Write(pic.Picture)
+					return
 				}
 			}
 		}
 	}
 
 	if ext == ".flac" {
-		if len(data) > 4 && string(data[:4]) == "fLaC" {
+		fBytes, err := os.ReadFile(tmpName)
+		if err == nil && len(fBytes) > 4 && string(fBytes[:4]) == "fLaC" {
 			offset := 4
-			for offset < len(data) {
-				if offset+4 > len(data) {
+			for offset < len(fBytes) {
+				if offset+4 > len(fBytes) {
 					break
 				}
-				header := data[offset]
+				header := fBytes[offset]
 				isLast := (header & 0x80) != 0
 				blockType := header & 0x7F
 
-				length := int(data[offset+1])<<16 | int(data[offset+2])<<8 | int(data[offset+3])
+				length := int(fBytes[offset+1])<<16 | int(fBytes[offset+2])<<8 | int(fBytes[offset+3])
 				offset += 4
 
-				if offset+length > len(data) {
+				if offset+length > len(fBytes) {
 					break
 				}
 
 				if blockType == 6 {
-					blockData := data[offset : offset+length]
+					blockData := fBytes[offset : offset+length]
 					for i := 0; i < len(blockData)-4; i++ {
 						if (blockData[i] == 0xFF && blockData[i+1] == 0xD8) ||
 							(blockData[i] == 0x89 && blockData[i+1] == 0x50 && blockData[i+2] == 0x4E && blockData[i+3] == 0x47) {
