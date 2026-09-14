@@ -96,15 +96,13 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		// Descargamos 4 MB para asegurar la lectura en archivos grandes de la nube
 		rangeInput := &s3.GetObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(name),
-			Range:  aws.String("bytes=0-4194304"),
+			Range:  aws.String("bytes=0-4194304"), // 4 MB iniciales
 		}
 		res, err := s3Client.GetObject(context.TODO(), rangeInput)
 		if err != nil {
-			log.Printf("[ERROR] No se pudo obtener rango para %s: %v", name, err)
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
@@ -112,7 +110,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		data, err := io.ReadAll(res.Body)
 		res.Body.Close()
 		if err != nil {
-			log.Printf("[ERROR] No se pudo leer body para %s: %v", name, err)
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
@@ -134,9 +131,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 						artist = a
 					}
 					tag.Close()
-					log.Printf("[MP3 OK] %s -> Título: '%s', Artista: '%s'", name, title, artist)
-				} else {
-					log.Printf("[MP3 WARN] No se pudo parsear id3v2 en %s: %v", name, err)
 				}
 			}
 		}
@@ -144,13 +138,12 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		if ext == ".wav" {
 			if len(data) > 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WAVE" {
 				offset := 12
-				foundID3 := false
 				for offset < len(data)-8 {
 					chunkID := string(data[offset : offset+4])
 					chunkSize := int(data[offset+4]) | int(data[offset+5])<<8 | int(data[offset+6])<<16 | int(data[offset+7])<<24
 
+					// 1. Revisar si tiene bloque ID3 dentro del WAV
 					if chunkID == "ID3 " || chunkID == "id3 " {
-						foundID3 = true
 						if offset+8+chunkSize <= len(data) {
 							tagData := data[offset+8 : offset+8+chunkSize]
 							tmpFile, err := os.CreateTemp("", "wav-id3-*.tmp")
@@ -169,13 +162,38 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 										artist = a
 									}
 									tag.Close()
-									log.Printf("[WAV ID3 OK] %s -> Título: '%s', Artista: '%s'", name, title, artist)
-								} else {
-									log.Printf("[WAV WARN] id3v2 falló al abrir chunk en %s: %v", name, err)
 								}
 							}
 						}
 						break
+					}
+
+					// 2. Revisar si tiene bloques estándar LIST / INFO (INAM = Título, IART = Artista)
+					if chunkID == "LIST" && chunkSize >= 4 {
+						if offset+12 <= len(data) {
+							listType := string(data[offset+8 : offset+12])
+							if listType == "INFO" {
+								subOffset := offset + 12
+								endOffset := offset + 8 + chunkSize
+								for subOffset < endOffset && subOffset+8 <= len(data) {
+									subID := string(data[subOffset : subOffset+4])
+									subSize := int(data[subOffset+4]) | int(data[subOffset+5])<<8 | int(data[subOffset+6])<<16 | int(data[subOffset+7])<<24
+									if subOffset+8+subSize <= len(data) {
+										val := string(data[subOffset+8 : subOffset+8+subSize])
+										val = strings.Trim(val, "\x00")
+										if subID == "INAM" && val != "" {
+											title = val
+										} else if subID == "IART" && val != "" {
+											artist = val
+										}
+									}
+									subOffset += 8 + subSize
+									if subSize%2 != 0 {
+										subOffset++
+									}
+								}
+							}
+						}
 					}
 
 					offset += 8 + chunkSize
@@ -183,11 +201,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 						offset++
 					}
 				}
-				if !foundID3 {
-					log.Printf("[WAV INFO] El archivo %s no contiene un bloque ID3 dentro de los primeros 4MB leídos (o usa otro estándar de metadatos WAV)", name)
-				}
-			} else {
-				log.Printf("[WAV WARN] El archivo %s no tiene cabecera RIFF/WAVE válida en los primeros bytes descargados", name)
 			}
 		}
 
@@ -252,7 +265,7 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 	rangeInput := &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(songName),
-		Range:  aws.String("bytes=0-4194304"), // 4 MB para carátulas grandes
+		Range:  aws.String("bytes=0-4194304"),
 	}
 	res, err := s3Client.GetObject(context.TODO(), rangeInput)
 	if err != nil {
@@ -268,7 +281,6 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if ext == ".mp3" || ext == ".wav" {
-		// Intentamos lectura directa con id3v2 por si acaso el tag está al inicio
 		tmpFile, err := os.CreateTemp("", "cover-*.tmp")
 		if err == nil {
 			tmpName := tmpFile.Name()
@@ -286,46 +298,6 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 						w.Write(pic.Picture)
 						return
 					}
-				}
-			}
-		}
-
-		// Si es WAV y tiene el bloque ID3 en la estructura RIFF, lo buscamos
-		if ext == ".wav" && len(data) > 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WAVE" {
-			offset := 12
-			for offset < len(data)-8 {
-				chunkID := string(data[offset : offset+4])
-				chunkSize := int(data[offset+4]) | int(data[offset+5])<<8 | int(data[offset+6])<<16 | int(data[offset+7])<<24
-
-				if chunkID == "ID3 " || chunkID == "id3 " {
-					if offset+8+chunkSize <= len(data) {
-						tagData := data[offset+8 : offset+8+chunkSize]
-						tFile, err := os.CreateTemp("", "wav-cov-*.tmp")
-						if err == nil {
-							tName := tFile.Name()
-							tFile.Write(tagData)
-							tFile.Close()
-							defer os.Remove(tName)
-
-							tag, err := id3v2.Open(tName, id3v2.Options{Parse: true})
-							if err == nil {
-								defer tag.Close()
-								pictures := tag.GetFrames(tag.CommonID("Attached picture"))
-								for _, f := range pictures {
-									if pic, ok := f.(id3v2.PictureFrame); ok {
-										w.Header().Set("Content-Type", pic.MimeType)
-										w.Write(pic.Picture)
-										return
-									}
-								}
-							}
-						}
-					}
-				}
-
-				offset += 8 + chunkSize
-				if chunkSize%2 != 0 {
-					offset++
 				}
 			}
 		}
@@ -384,7 +356,7 @@ func main() {
 	http.HandleFunc("/cover", enableCORS(getCover))
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
-	port := os.Getenv("PORT")
+    port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
