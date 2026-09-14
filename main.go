@@ -106,17 +106,19 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			fileSize = *headRes.ContentLength
 		}
 
-		log.Printf("[DEBUG] Analizando archivo: '%s' | Extensión: %s | Tamaño en R2: %d bytes", name, ext, fileSize)
+		log.Printf("[DEBUG] Analizando archivo: '%s' | Tamaño: %d bytes", name, fileSize)
 
+		// Como R2 no permite rangos múltiples con comas, descargamos los ÚLTIMOS 2 MB del archivo 
+		// que es exactamente donde Mp3tag guarda los metadatos y carátulas en los WAV gigantes.
 		var rangeStr string
-		if fileSize < 15728640 && fileSize > 0 {
+		if fileSize > 2097152 {
+			start := fileSize - 2097152
+			rangeStr = fmt.Sprintf("bytes=%d-%d", start, fileSize-1)
+		} else if fileSize > 0 {
 			rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
 		} else {
-			startTail := fileSize - 4194304
-			if startTail < 4194304 {
-				startTail = 4194304
-			}
-			rangeStr = fmt.Sprintf("bytes=0-4194304,%d-%d", startTail, fileSize-1)
+			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
+			continue
 		}
 
 		res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
@@ -125,7 +127,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			Range:  aws.String(rangeStr),
 		})
 		if err != nil {
-			log.Printf("[DEBUG ERROR] No se pudo descargar objeto de R2 para %s: %v", name, err)
+			log.Printf("[DEBUG ERROR] Falló rango en %s: %v", name, err)
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
@@ -133,46 +135,12 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		data, err := io.ReadAll(res.Body)
 		res.Body.Close()
 		if err != nil {
-			log.Printf("[DEBUG ERROR] No se pudo leer el stream para %s: %v", name, err)
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
 
-		log.Printf("[DEBUG INFO] Descargados %d bytes para el análisis de %s", len(data), name)
-
-		if ext == ".wav" {
-			if len(data) >= 12 {
-				riffHeader := string(data[:4])
-				waveHeader := string(data[8:12])
-				log.Printf("[WAV DEBUG %s] Cabecera inicial -> RIFF: '%s' | WAVE: '%s'", name, riffHeader, waveHeader)
-			}
-
-			offset := 12
-			foundTags := false
-			for offset < len(data)-8 {
-				chunkID := string(data[offset : offset+4])
-				chunkSize := int(data[offset+4]) | int(data[offset+5])<<8 | int(data[offset+6])<<16 | int(data[offset+7])<<24
-
-				log.Printf("[WAV CHUNK %s] Encontrado bloque '%s' de tamaño %d bytes en el offset %d", name, chunkID, chunkSize, offset)
-
-				if chunkID == "id3 " || chunkID == "ID3 " || chunkID == "LIST" {
-					foundTags = true
-				}
-
-				offset += 8 + chunkSize
-				if chunkSize%2 != 0 {
-					offset++
-				}
-				if chunkSize <= 0 {
-					break
-				}
-			}
-			if !foundTags {
-				log.Printf("[WAV ALERTA %s] NO se detectó ningún bloque 'ID3' ni 'LIST' en el rango descargado de este WAV.", name)
-			}
-		}
-
-		tmpFile, err := os.CreateTemp("", "debug-meta-*.tmp")
+		// Abrimos el bloque final con id3v2
+		tmpFile, err := os.CreateTemp("", "meta-*.tmp")
 		if err == nil {
 			tmpName := tmpFile.Name()
 			tmpFile.Write(data)
@@ -184,7 +152,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 				defer tag.Close()
 				t := tag.Title()
 				a := tag.Artist()
-				log.Printf("[ID3V2 RESULTADO %s] Lector ID3 encontró -> Título: '%s' | Artista: '%s'", name, t, a)
+				log.Printf("[ID3V2 OK] %s -> Título: '%s' | Artista: '%s'", name, t, a)
 				if t != "" {
 					title = t
 				}
@@ -192,7 +160,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 					artist = a
 				}
 			} else {
-				log.Printf("[ID3V2 ERROR %s] id3v2.Open falló: %v", name, err)
+				log.Printf("[ID3V2 WARN] No se detectó ID3 al final de %s: %v", name, err)
 			}
 		}
 
@@ -265,10 +233,14 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var rangeStr string
-	if fileSize < 15728640 && fileSize > 0 {
+	if fileSize > 2097152 {
+		start := fileSize - 2097152
+		rangeStr = fmt.Sprintf("bytes=%d-%d", start, fileSize-1)
+	} else if fileSize > 0 {
 		rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
 	} else {
-		rangeStr = fmt.Sprintf("bytes=0-4194304,%d-%d", fileSize-4194304, fileSize-1)
+		http.Error(w, "No cover found", http.StatusNotFound)
+		return
 	}
 
 	res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
