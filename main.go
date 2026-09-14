@@ -1,13 +1,20 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awscfg "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bogem/id3v2/v2"
 )
 
@@ -17,11 +24,44 @@ type Song struct {
 	Artista string `json:"artista"`
 }
 
+var s3Client *s3.Client
+var bucketName string
+
+func initS3() {
+	bucketName = os.Getenv("R2_BUCKET_NAME")
+	accountID := os.Getenv("R2_ACCOUNT_ID")
+	accessKey := os.Getenv("R2_ACCESS_KEY_ID")
+	secretKey := os.Getenv("R2_SECRET_ACCESS_KEY")
+
+	if accountID == "" || bucketName == "" {
+		log.Println("Aviso: Variables de entorno de R2 no configuradas. El servidor funcionará en modo local o fallará si se requiere la nube.")
+		return
+	}
+
+	r2Resolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		return aws.Endpoint{
+			URL: fmt.Sprintf("https://%s.r2.cloudflarestorage.com", accountID),
+		}, nil
+	})
+
+	cfg, err := awscfg.LoadDefaultConfig(context.TODO(),
+		awscfg.WithEndpointResolverWithOptions(r2Resolver),
+		awscfg.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
+		awscfg.WithRegion("auto"),
+	)
+	if err != nil {
+		log.Fatalf("Error al cargar configuración de AWS/R2: %v", err)
+	}
+
+	s3Client = s3.NewFromConfig(cfg)
+}
+
 func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Range")
+		w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Range, Content-Length")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -30,86 +70,33 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// getSongs ahora lista automáticamente los archivos directamente desde la nube de Cloudflare R2
 func getSongs(w http.ResponseWriter, r *http.Request) {
-	musicDir := "./musica"
-	files, err := os.ReadDir(musicDir)
+	if s3Client == nil {
+		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
+		return
+	}
+
+	output, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucketName),
+	})
 	if err != nil {
-		http.Error(w, fmt.Sprintf("No se encuentra la carpeta 'musica' en: %s", musicDir), http.StatusInternalServerError)
+		http.Error(w, "Error al listar canciones de la nube: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	var songs []Song
-	for _, file := range files {
-		if file.IsDir() {
-			continue
-		}
-
-		name := file.Name()
+	for _, obj := range output.Contents {
+		name := aws.ToString(obj.Key)
 		ext := strings.ToLower(filepath.Ext(name))
 		if ext != ".mp3" && ext != ".flac" && ext != ".wav" {
 			continue
 		}
 
 		title := strings.TrimSuffix(name, ext)
-		artist := "Música Local"
-		filePath := filepath.Join(musicDir, name)
+		artist := "Cloud Library"
 
-		// 1. Extraer metadatos para MP3
-		if ext == ".mp3" {
-			tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
-			if err == nil {
-				if t := tag.Title(); t != "" {
-					title = t
-				}
-				if a := tag.Artist(); a != "" {
-					artist = a
-				}
-				tag.Close()
-			}
-		}
-
-		// 2. Extraer metadatos para WAV (leyendo el bloque ID3 dentro de la estructura RIFF)
-		if ext == ".wav" {
-			data, err := os.ReadFile(filePath)
-			if err == nil && len(data) > 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WAVE" {
-				offset := 12
-				for offset < len(data)-8 {
-					chunkID := string(data[offset : offset+4])
-					chunkSize := int(data[offset+4]) | int(data[offset+5])<<8 | int(data[offset+6])<<16 | int(data[offset+7])<<24
-
-					if chunkID == "ID3 " || chunkID == "id3 " {
-						if offset+8+chunkSize <= len(data) {
-							tagData := data[offset+8 : offset+8+chunkSize]
-							tmpFile, err := os.CreateTemp("", "wav-id3-*.tmp")
-							if err == nil {
-								tmpName := tmpFile.Name()
-								tmpFile.Write(tagData)
-								tmpFile.Close()
-								defer os.Remove(tmpName)
-
-								tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
-								if err == nil {
-									if t := tag.Title(); t != "" {
-										title = t
-									}
-									if a := tag.Artist(); a != "" {
-										artist = a
-									}
-									tag.Close()
-								}
-							}
-						}
-						break
-					}
-
-					offset += 8 + chunkSize
-					if chunkSize%2 != 0 {
-						offset++
-					}
-				}
-			}
-		}
-
+		// Opcional: Si quieres extraer metadatos descargando temporalmente los primeros KB del archivo en la nube
 		songs = append(songs, Song{
 			Nombre:  name,
 			Titulo:  title,
@@ -121,145 +108,65 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(songs)
 }
 
+// playSong transmite las canciones de la nube soportando Range Requests para sesiones de 2 horas
 func playSong(w http.ResponseWriter, r *http.Request) {
-	musicDir := "./musica"
 	songName := r.URL.Query().Get("song")
-	filePath := filepath.Join(musicDir, songName)
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		http.Error(w, "Archivo no encontrado", http.StatusNotFound)
-		return
-	}
-	defer file.Close()
-
-	stat, err := file.Stat()
-	if err != nil {
-		http.Error(w, "Error interno", http.StatusInternalServerError)
+	if s3Client == nil {
+		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
 		return
 	}
 
-	http.ServeContent(w, r, stat.Name(), stat.ModTime(), file)
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(songName),
+	}
+
+	// Manejo de peticiones de rango enviadas por el navegador para saltar en archivos pesados
+	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+		input.Range = aws.String(rangeHeader)
+	}
+
+	result, err := s3Client.GetObject(context.TODO(), input)
+	if err != nil {
+		http.Error(w, "Archivo no encontrado en la nube", http.StatusNotFound)
+		return
+	}
+	defer result.Body.Close()
+
+	if result.ContentType != nil {
+		w.Header().Set("Content-Type", *result.ContentType)
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+
+	if result.ContentLength != nil {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", *result.ContentLength))
+	}
+	if result.ContentRange != nil {
+		w.Header().Set("Content-Range", *result.ContentRange)
+		w.WriteHeader(http.StatusPartialContent)
+	}
+
+	io.Copy(w, result.Body)
 }
 
 func getCover(w http.ResponseWriter, r *http.Request) {
-	musicDir := "./musica"
-	songName := r.URL.Query().Get("song")
-	filePath := filepath.Join(musicDir, songName)
-	ext := strings.ToLower(filepath.Ext(songName))
-
-	// 1. Carátula para MP3
-	if ext == ".mp3" {
-		tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
-		if err == nil {
-			defer tag.Close()
-			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
-			for _, f := range pictures {
-				if pic, ok := f.(id3v2.PictureFrame); ok {
-					w.Header().Set("Content-Type", pic.MimeType)
-					w.Write(pic.Picture)
-					return
-				}
-			}
-		}
-	}
-
-	// 2. Carátula para WAV
-	if ext == ".wav" {
-		data, err := os.ReadFile(filePath)
-		if err == nil && len(data) > 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WAVE" {
-			offset := 12
-			for offset < len(data)-8 {
-				chunkID := string(data[offset : offset+4])
-				chunkSize := int(data[offset+4]) | int(data[offset+5])<<8 | int(data[offset+6])<<16 | int(data[offset+7])<<24
-
-				if chunkID == "ID3 " || chunkID == "id3 " {
-					if offset+8+chunkSize <= len(data) {
-						tagData := data[offset+8 : offset+8+chunkSize]
-						tmpFile, err := os.CreateTemp("", "wav-id3-*.tmp")
-						if err == nil {
-							tmpName := tmpFile.Name()
-							tmpFile.Write(tagData)
-							tmpFile.Close()
-							defer os.Remove(tmpName)
-
-							tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
-							if err == nil {
-								defer tag.Close()
-								pictures := tag.GetFrames(tag.CommonID("Attached picture"))
-								for _, f := range pictures {
-									if pic, ok := f.(id3v2.PictureFrame); ok {
-										w.Header().Set("Content-Type", pic.MimeType)
-										w.Write(pic.Picture)
-										return
-									}
-								}
-							}
-						}
-					}
-				}
-
-				offset += 8 + chunkSize
-				if chunkSize%2 != 0 {
-					offset++
-				}
-			}
-		}
-	}
-
-	// 3. Carátula para FLAC
-	if ext == ".flac" {
-		data, err := os.ReadFile(filePath)
-		if err == nil && len(data) > 4 && string(data[:4]) == "fLaC" {
-			offset := 4
-			for offset < len(data) {
-				if offset+4 > len(data) {
-					break
-				}
-				header := data[offset]
-				isLast := (header & 0x80) != 0
-				blockType := header & 0x7F
-				
-				length := int(data[offset+1])<<16 | int(data[offset+2])<<8 | int(data[offset+3])
-				offset += 4
-
-				if offset+length > len(data) {
-					break
-				}
-
-				if blockType == 6 {
-					blockData := data[offset : offset+length]
-					for i := 0; i < len(blockData)-4; i++ {
-						if (blockData[i] == 0xFF && blockData[i+1] == 0xD8) || 
-						   (blockData[i] == 0x89 && blockData[i+1] == 0x50 && blockData[i+2] == 0x4E && blockData[i+3] == 0x47) {
-							mType := "image/jpeg"
-							if blockData[i] == 0x89 {
-								mType = "image/png"
-							}
-							w.Header().Set("Content-Type", mType)
-							w.Write(blockData[i:])
-							return
-						}
-					}
-				}
-
-				if isLast {
-					break
-				}
-				offset += length
-			}
-		}
-	}
-
+	// Aquí puedes implementar la lectura de la carátula directo desde R2 si lo deseas
 	http.Error(w, "No cover found", http.StatusNotFound)
 }
 
 func main() {
+	initS3()
+
 	http.HandleFunc("/songs", enableCORS(getSongs))
 	http.HandleFunc("/play", enableCORS(playSong))
 	http.HandleFunc("/cover", enableCORS(getCover))
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
-	fmt.Println("Servidor Go escuchando en http://localhost:8080")
-	http.ListenAndServe(":8080", nil)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("Servidor Go escuchando en el puerto %s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
