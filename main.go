@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -97,7 +96,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		// 1. Obtenemos el tamaño real del archivo en S3
 		headRes, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(name),
@@ -110,14 +108,10 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 
 		log.Printf("[DEBUG] Analizando archivo: '%s' | Extensión: %s | Tamaño en R2: %d bytes", name, ext, fileSize)
 
-		// MODO DEBUG TOTAL: Para salir de dudas, si el archivo pesa menos de 15MB, 
-		// vamos a descargarlo ENTERO una vez para ver exactamente qué demonios tiene dentro.
-		// (Si pesa más, descargamos los extremos críticos).
 		var rangeStr string
 		if fileSize < 15728640 && fileSize > 0 {
 			rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
 		} else {
-			// Si es muy grande, tiramos de extremos grandes (primeros 4MB y últimos 4MB)
 			startTail := fileSize - 4194304
 			if startTail < 4194304 {
 				startTail = 4194304
@@ -147,14 +141,12 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[DEBUG INFO] Descargados %d bytes para el análisis de %s", len(data), name)
 
 		if ext == ".wav" {
-			// Inspeccionar cabecera RIFF
 			if len(data) >= 12 {
 				riffHeader := string(data[:4])
 				waveHeader := string(data[8:12])
 				log.Printf("[WAV DEBUG %s] Cabecera inicial -> RIFF: '%s' | WAVE: '%s'", name, riffHeader, waveHeader)
 			}
 
-			// Barrido de TODOS los Chunks dentro de los datos descargados para ver qué bloques existen realmente
 			offset := 12
 			foundTags := false
 			for offset < len(data)-8 {
@@ -171,7 +163,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 				if chunkSize%2 != 0 {
 					offset++
 				}
-				// Evitar bucles infinitos si hay corrupción
 				if chunkSize <= 0 {
 					break
 				}
@@ -181,7 +172,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Intentar abrir con id3v2 en un archivo temporal
 		tmpFile, err := os.CreateTemp("", "debug-meta-*.tmp")
 		if err == nil {
 			tmpName := tmpFile.Name()
