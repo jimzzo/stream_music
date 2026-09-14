@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -70,7 +71,6 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// getSongs extrae metadatos leyendo inicio y final (donde Mp3tag guarda la info en WAV)
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -97,7 +97,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		// Consultamos el tamaño total del archivo en R2
+		// 1. Obtenemos el tamaño real del archivo en S3
 		headRes, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(name),
@@ -108,14 +108,21 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			fileSize = *headRes.ContentLength
 		}
 
-		// Rango inteligente: Primeros 2MB y último 1MB (donde Mp3tag esconde los tags en WAV)
-		rangeStr := "bytes=0-2097152"
-		if fileSize > 2097152 {
-			startTail := fileSize - 1048576
-			if startTail < 2097152 {
-				startTail = 2097152
+		log.Printf("[DEBUG] Analizando archivo: '%s' | Extensión: %s | Tamaño en R2: %d bytes", name, ext, fileSize)
+
+		// MODO DEBUG TOTAL: Para salir de dudas, si el archivo pesa menos de 15MB, 
+		// vamos a descargarlo ENTERO una vez para ver exactamente qué demonios tiene dentro.
+		// (Si pesa más, descargamos los extremos críticos).
+		var rangeStr string
+		if fileSize < 15728640 && fileSize > 0 {
+			rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
+		} else {
+			// Si es muy grande, tiramos de extremos grandes (primeros 4MB y últimos 4MB)
+			startTail := fileSize - 4194304
+			if startTail < 4194304 {
+				startTail = 4194304
 			}
-			rangeStr = fmt.Sprintf("bytes=0-2097152,%d-%d", startTail, fileSize-1)
+			rangeStr = fmt.Sprintf("bytes=0-4194304,%d-%d", startTail, fileSize-1)
 		}
 
 		res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
@@ -124,6 +131,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			Range:  aws.String(rangeStr),
 		})
 		if err != nil {
+			log.Printf("[DEBUG ERROR] No se pudo descargar objeto de R2 para %s: %v", name, err)
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
@@ -131,29 +139,70 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		data, err := io.ReadAll(res.Body)
 		res.Body.Close()
 		if err != nil {
+			log.Printf("[DEBUG ERROR] No se pudo leer el stream para %s: %v", name, err)
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
 
-		// Parseo de metadatos con id3v2 (funciona tanto para MP3 como para los ID3 incrustados en WAV por Mp3tag)
-		if ext == ".mp3" || ext == ".wav" {
-			tmpFile, err := os.CreateTemp("", "meta-*.tmp")
-			if err == nil {
-				tmpName := tmpFile.Name()
-				tmpFile.Write(data)
-				tmpFile.Close()
-				defer os.Remove(tmpName)
+		log.Printf("[DEBUG INFO] Descargados %d bytes para el análisis de %s", len(data), name)
 
-				tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
-				if err == nil {
-					if t := tag.Title(); t != "" {
-						title = t
-					}
-					if a := tag.Artist(); a != "" {
-						artist = a
-					}
-					tag.Close()
+		if ext == ".wav" {
+			// Inspeccionar cabecera RIFF
+			if len(data) >= 12 {
+				riffHeader := string(data[:4])
+				waveHeader := string(data[8:12])
+				log.Printf("[WAV DEBUG %s] Cabecera inicial -> RIFF: '%s' | WAVE: '%s'", name, riffHeader, waveHeader)
+			}
+
+			// Barrido de TODOS los Chunks dentro de los datos descargados para ver qué bloques existen realmente
+			offset := 12
+			foundTags := false
+			for offset < len(data)-8 {
+				chunkID := string(data[offset : offset+4])
+				chunkSize := int(data[offset+4]) | int(data[offset+5])<<8 | int(data[offset+6])<<16 | int(data[offset+7])<<24
+
+				log.Printf("[WAV CHUNK %s] Encontrado bloque '%s' de tamaño %d bytes en el offset %d", name, chunkID, chunkSize, offset)
+
+				if chunkID == "id3 " || chunkID == "ID3 " || chunkID == "LIST" {
+					foundTags = true
 				}
+
+				offset += 8 + chunkSize
+				if chunkSize%2 != 0 {
+					offset++
+				}
+				// Evitar bucles infinitos si hay corrupción
+				if chunkSize <= 0 {
+					break
+				}
+			}
+			if !foundTags {
+				log.Printf("[WAV ALERTA %s] NO se detectó ningún bloque 'ID3' ni 'LIST' en el rango descargado de este WAV.", name)
+			}
+		}
+
+		// Intentar abrir con id3v2 en un archivo temporal
+		tmpFile, err := os.CreateTemp("", "debug-meta-*.tmp")
+		if err == nil {
+			tmpName := tmpFile.Name()
+			tmpFile.Write(data)
+			tmpFile.Close()
+			defer os.Remove(tmpName)
+
+			tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
+			if err == nil {
+				defer tag.Close()
+				t := tag.Title()
+				a := tag.Artist()
+				log.Printf("[ID3V2 RESULTADO %s] Lector ID3 encontró -> Título: '%s' | Artista: '%s'", name, t, a)
+				if t != "" {
+					title = t
+				}
+				if a != "" {
+					artist = a
+				}
+			} else {
+				log.Printf("[ID3V2 ERROR %s] id3v2.Open falló: %v", name, err)
 			}
 		}
 
@@ -168,7 +217,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(songs)
 }
 
-// playSong realiza streaming por rangos estándar (S3 Range Requests)
 func playSong(w http.ResponseWriter, r *http.Request) {
 	songName := r.URL.Query().Get("song")
 	if s3Client == nil {
@@ -208,7 +256,6 @@ func playSong(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, result.Body)
 }
 
-// getCover extrae la carátula buscando también en la parte final del archivo WAV de Mp3tag
 func getCover(w http.ResponseWriter, r *http.Request) {
 	songName := r.URL.Query().Get("song")
 	ext := strings.ToLower(filepath.Ext(songName))
@@ -227,10 +274,11 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		fileSize = *headRes.ContentLength
 	}
 
-	rangeStr := "bytes=0-4194304"
-	if fileSize > 4194304 {
-		startTail := fileSize - 2097152 // Últimos 2 MB donde Mp3tag guarda carátulas en WAV
-		rangeStr = fmt.Sprintf("bytes=0-2097152,%d-%d", startTail, fileSize-1)
+	var rangeStr string
+	if fileSize < 15728640 && fileSize > 0 {
+		rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
+	} else {
+		rangeStr = fmt.Sprintf("bytes=0-4194304,%d-%d", fileSize-4194304, fileSize-1)
 	}
 
 	res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
@@ -250,7 +298,6 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Carátula para MP3 y WAV (con id3v2 abriendo el bloque combinado inicio/final)
 	if ext == ".mp3" || ext == ".wav" {
 		tmpFile, err := os.CreateTemp("", "cover-*.tmp")
 		if err == nil {
@@ -274,7 +321,6 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Carátula para FLAC
 	if ext == ".flac" {
 		if len(data) > 4 && string(data[:4]) == "fLaC" {
 			offset := 4
