@@ -186,34 +186,110 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Descargamos una porción inicial para buscar la carátula integrada en el MP3
-	if ext == ".mp3" {
-		rangeInput := &s3.GetObjectInput{
-			Bucket: aws.String(bucketName),
-			Key:    aws.String(songName),
-			Range:  aws.String("bytes=0-524288"), // Primeros 512 KB donde suele estar la carátula
-		}
-		res, err := s3Client.GetObject(context.TODO(), rangeInput)
-		if err == nil {
-			tmpFile, err := os.CreateTemp("", "cover-*.mp3")
-			if err == nil {
-				tmpName := tmpFile.Name()
-				io.Copy(tmpFile, res.Body)
-				tmpFile.Close()
-				res.Body.Close()
-				defer os.Remove(tmpName)
+	// Descargamos un rango amplio (3 MB) para asegurar que carátulas grandes no se corten
+	rangeInput := &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(songName),
+		Range:  aws.String("bytes=0-3145728"),
+	}
+	res, err := s3Client.GetObject(context.TODO(), rangeInput)
+	if err != nil {
+		http.Error(w, "No cover found", http.StatusNotFound)
+		return
+	}
+	defer res.Body.Close()
 
-				tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
-				if err == nil {
-					defer tag.Close()
-					pictures := tag.GetFrames(tag.CommonID("Attached picture"))
-					for _, f := range pictures {
-						if pic, ok := f.(id3v2.PictureFrame); ok {
-							w.Header().Set("Content-Type", pic.MimeType)
-							w.Write(pic.Picture)
-							return
-						}
+	// Tanto MP3 como WAV (etiquetados con Mp3tag usando RIFF/ID3) se leen con id3v2
+	if ext == ".mp3" || ext == ".wav" {
+		prefix := "cover-*.mp3"
+		if ext == ".wav" {
+			prefix = "cover-*.wav"
+		}
+		
+		tmpFile, err := os.CreateTemp("", prefix)
+		if err == nil {
+			tmpName := tmpFile.Name()
+			io.Copy(tmpFile, res.Body)
+			tmpFile.Close()
+			defer os.Remove(tmpName)
+
+			tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
+			if err == nil {
+				defer tag.Close()
+				pictures := tag.GetFrames(tag.CommonID("Attached picture"))
+				for _, f := range pictures {
+					if pic, ok := f.(id3v2.PictureFrame); ok {
+						w.Header().Set("Content-Type", pic.MimeType)
+						w.Write(pic.Picture)
+						return
 					}
+				}
+			}
+		}
+	} else if ext == ".flac" {
+		// (Aquí se queda tu código de FLAC que ya lee los bloques PICTURE)
+		data, err := io.ReadAll(res.Body)
+		if err == nil && len(data) > 4 && string(data[0:4]) == "fLaC" {
+			offset := 4
+			for offset < len(data) {
+				if offset+4 > len(data) {
+					break
+				}
+				header := data[offset]
+				isLast := (header & 0x80) != 0
+				blockType := header & 0x7F
+				length := int(data[offset+1])<<16 | int(data[offset+2])<<8 | int(data[offset+3])
+				offset += 4
+
+				if offset+length > len(data) {
+					break
+				}
+
+				if blockType == 6 { // PICTURE en FLAC
+					pData := data[offset : offset+length]
+					if len(pData) > 32 {
+						pOffset := 0
+						pOffset += 4
+						if pOffset+4 > len(pData) {
+							break
+						}
+						mimeLen := int(pData[pOffset])*16777216 + int(pData[pOffset+1])*65536 + int(pData[pOffset+2])*256 + int(pData[pOffset+3])
+						pOffset += 4
+
+						if pOffset+mimeLen > len(pData) {
+							break
+						}
+						mimeType := string(pData[pOffset : pOffset+mimeLen])
+						pOffset += mimeLen
+
+						if pOffset+4 > len(pData) {
+							break
+						}
+						descLen := int(pData[pOffset])*16777216 + int(pData[pOffset+1])*65536 + int(pData[pOffset+2])*256 + int(pData[pOffset+3])
+						pOffset += 4
+						pOffset += descLen
+						pOffset += 20
+
+						if pOffset+4 > len(pData) {
+							break
+						}
+						picDataLen := int(pData[pOffset])*16777216 + int(pData[pOffset+1])*65536 + int(pData[pOffset+2])*256 + int(pData[pOffset+3])
+						pOffset += 4
+
+						if pOffset+picDataLen > len(pData) {
+							break
+						}
+						pictureBytes := pData[pOffset : pOffset+picDataLen]
+
+						w.Header().Set("Content-Type", mimeType)
+						w.Write(pictureBytes)
+						return
+					}
+				}
+
+				offset += length
+				if isLast {
+					break
 				}
 			}
 		}
@@ -221,7 +297,6 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 
 	http.Error(w, "No cover found", http.StatusNotFound)
 }
-
 func main() {
 	initS3()
 
