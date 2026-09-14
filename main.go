@@ -71,6 +71,7 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // getSongs lista los archivos de la nube y extrae metadatos descargando una pequeña porción inicial del archivo
+// getSongs lista archivos y extrae metadatos para MP3, WAV y FLAC
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -89,23 +90,30 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	for _, obj := range output.Contents {
 		name := aws.ToString(obj.Key)
 		ext := strings.ToLower(filepath.Ext(name))
-		if ext != ".mp3" && ext != ".flac" && ext != ".wav" {
+		
+		// Omitir archivos temporales de subida si se ven en el listado
+		if strings.Contains(name, "Multipart") || (ext != ".mp3" && ext != ".flac" && ext != ".wav") {
 			continue
 		}
 
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		// Si es MP3, podemos leer metadatos descargando los primeros 128KB del archivo desde R2 de forma eficiente
-		if ext == ".mp3" {
+		// Tanto MP3 como WAV (etiquetados con Mp3tag usando RIFF/ID3) leen sus metadatos con id3v2
+		if ext == ".mp3" || ext == ".wav" {
 			rangeInput := &s3.GetObjectInput{
 				Bucket: aws.String(bucketName),
 				Key:    aws.String(name),
-				Range:  aws.String("bytes=0-131071"), // Primeros 128 KB
+				Range:  aws.String("bytes=0-131071"), // Bajamos solo los primeros KB para leer el encabezado de etiquetas
 			}
 			res, err := s3Client.GetObject(context.TODO(), rangeInput)
 			if err == nil {
-				tmpFile, err := os.CreateTemp("", "meta-*.mp3")
+				prefix := "meta-*.mp3"
+				if ext == ".wav" {
+					prefix = "meta-*.wav"
+				}
+
+				tmpFile, err := os.CreateTemp("", prefix)
 				if err == nil {
 					tmpName := tmpFile.Name()
 					io.Copy(tmpFile, res.Body)
@@ -137,7 +145,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(songs)
 }
-
 // playSong transmite las canciones de la nube con soporte de Range Requests
 func playSong(w http.ResponseWriter, r *http.Request) {
 	songName := r.URL.Query().Get("song")
