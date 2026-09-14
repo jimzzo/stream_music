@@ -77,7 +77,41 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Descarga cualquier archivo completo a un disco temporal mediante streaming (cero RAM, seguro contra OOM)
+// Descarga un rango seguro (ej. los primeros 2 MB) para metadatos sin congelar la app con archivos de 1.2GB
+func downloadRangeToDisk(ctx context.Context, key string, fileSize int64) (string, error) {
+	rangeStr := "bytes=0-2097152" // 2 MB
+	if fileSize > 0 && fileSize < 2097152 {
+		rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
+	}
+
+	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+		Range:  aws.String(rangeStr),
+	})
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+
+	tmpFile, err := os.CreateTemp("", "meta-*.tmp")
+	if err != nil {
+		return "", err
+	}
+	tmpName := tmpFile.Name()
+
+	_, copyErr := io.Copy(tmpFile, res.Body)
+	tmpFile.Close()
+
+	if copyErr != nil {
+		os.Remove(tmpName)
+		return "", copyErr
+	}
+
+	return tmpName, nil
+}
+
+// Descarga el archivo COMPLETO solo cuando se pide la carátula o se reproduce (donde Render sí soporta streaming correcto)
 func downloadFullFileToDisk(ctx context.Context, key string) (string, error) {
 	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
@@ -105,7 +139,7 @@ func downloadFullFileToDisk(ctx context.Context, key string) (string, error) {
 	return tmpName, nil
 }
 
-// Extrae el bloque ID3v2 incrustado dentro del contenedor RIFF de un archivo WAV
+// Extrae el bloque ID3v2 del contenedor RIFF en archivos WAV
 func extractWavID3TagFile(wavFilePath string) string {
 	file, err := os.Open(wavFilePath)
 	if err != nil {
@@ -192,7 +226,13 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		tmpPath, err := downloadFullFileToDisk(context.TODO(), name)
+		var fileSize int64 = 0
+		if obj.Size != nil {
+			fileSize = *obj.Size
+		}
+
+		// Descargamos solo un fragmento inicial de 2MB para leer metadatos de forma rápida y sin colgar R2
+		tmpPath, err := downloadRangeToDisk(context.TODO(), name, fileSize)
 		if err == nil {
 			if ext == ".mp3" {
 				tag, err := id3v2.Open(tmpPath, id3v2.Options{Parse: true})
