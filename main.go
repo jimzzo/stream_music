@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -77,118 +78,36 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Descarga un rango seguro (ej. los primeros 2 MB) para metadatos sin congelar la app con archivos de 1.2GB
-func downloadRangeToDisk(ctx context.Context, key string, fileSize int64) (string, error) {
-	rangeStr := "bytes=0-2097152" // 2 MB
-	if fileSize > 0 && fileSize < 2097152 {
-		rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
+// Extrae el bloque ID3v2 directamente desde un búfer en memoria RAM (Cero uso de disco)
+func extractWavID3FromBytes(data []byte) io.Reader {
+	if len(data) < 12 {
+		return nil
+	}
+	if string(data[:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return nil
 	}
 
-	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(key),
-		Range:  aws.String(rangeStr),
-	})
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
+	offset := 12
+	for offset+8 <= len(data) {
+		chunkID := string(data[offset : offset+4])
+		chunkSize := binary.LittleEndian.Uint32(data[offset+4 : offset+8])
+		offset += 8
 
-	tmpFile, err := os.CreateTemp("", "meta-*.tmp")
-	if err != nil {
-		return "", err
-	}
-	tmpName := tmpFile.Name()
-
-	_, copyErr := io.Copy(tmpFile, res.Body)
-	tmpFile.Close()
-
-	if copyErr != nil {
-		os.Remove(tmpName)
-		return "", copyErr
-	}
-
-	return tmpName, nil
-}
-
-// Descarga el archivo COMPLETO solo cuando se pide la carátula o se reproduce (donde Render sí soporta streaming correcto)
-func downloadFullFileToDisk(ctx context.Context, key string) (string, error) {
-	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-
-	tmpFile, err := os.CreateTemp("", "media-*.tmp")
-	if err != nil {
-		return "", err
-	}
-	tmpName := tmpFile.Name()
-
-	_, copyErr := io.Copy(tmpFile, res.Body)
-	tmpFile.Close()
-
-	if copyErr != nil {
-		os.Remove(tmpName)
-		return "", copyErr
-	}
-
-	return tmpName, nil
-}
-
-// Extrae el bloque ID3v2 del contenedor RIFF en archivos WAV
-func extractWavID3TagFile(wavFilePath string) string {
-	file, err := os.Open(wavFilePath)
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-
-	header := make([]byte, 12)
-	if _, err := io.ReadFull(file, header); err != nil {
-		return ""
-	}
-	if string(header[:4]) != "RIFF" || string(header[8:]) != "WAVE" {
-		return ""
-	}
-
-	for {
-		chunkHeader := make([]byte, 8)
-		if _, err := io.ReadFull(file, chunkHeader); err != nil {
+		if offset+int(chunkSize) > len(data) {
 			break
 		}
-
-		chunkID := string(chunkHeader[:4])
-		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
 
 		if chunkID == "id3 " || chunkID == "ID3 " {
-			id3Data := make([]byte, chunkSize)
-			if _, err := io.ReadFull(file, id3Data); err != nil {
-				break
-			}
-
-			tmpTagFile, err := os.CreateTemp("", "wav-id3-*.tmp")
-			if err != nil {
-				return ""
-			}
-			tmpTagPath := tmpTagFile.Name()
-			tmpTagFile.Write(id3Data)
-			tmpTagFile.Close()
-			return tmpTagPath
+			id3Bytes := data[offset : offset+int(chunkSize)]
+			return bytes.NewReader(id3Bytes)
 		}
 
-		toSkip := int64(chunkSize)
-		if toSkip%2 != 0 {
-			toSkip++
-		}
-		if _, err := file.Seek(toSkip, io.SeekCurrent); err != nil {
-			break
+		offset += int(chunkSize)
+		if chunkSize%2 != 0 {
+			offset++
 		}
 	}
-	return ""
+	return nil
 }
 
 func getSongs(w http.ResponseWriter, r *http.Request) {
@@ -226,29 +145,20 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		var fileSize int64 = 0
-		if obj.Size != nil {
-			fileSize = *obj.Size
-		}
+		// Pedimos solo los primeros 512 KB en memoria RAM para leer metadatos rápidamente sin saturar nada
+		res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    aws.String(name),
+			Range:  aws.String("bytes=0-524288"),
+		})
 
-		// Descargamos solo un fragmento inicial de 2MB para leer metadatos de forma rápida y sin colgar R2
-		tmpPath, err := downloadRangeToDisk(context.TODO(), name, fileSize)
 		if err == nil {
-			if ext == ".mp3" {
-				tag, err := id3v2.Open(tmpPath, id3v2.Options{Parse: true})
-				if err == nil {
-					if t := tag.Title(); t != "" {
-						title = t
-					}
-					if a := tag.Artist(); a != "" {
-						artist = a
-					}
-					tag.Close()
-				}
-			} else if ext == ".wav" {
-				tagPath := extractWavID3TagFile(tmpPath)
-				if tagPath != "" {
-					tag, err := id3v2.Open(tagPath, id3v2.Options{Parse: true})
+			buf, readErr := io.ReadAll(res.Body)
+			res.Body.Close()
+
+			if readErr == nil && len(buf) > 0 {
+				if ext == ".mp3" {
+					tag, err := id3v2.ParseReader(bytes.NewReader(buf), id3v2.Options{Parse: true})
 					if err == nil {
 						if t := tag.Title(); t != "" {
 							title = t
@@ -256,12 +166,21 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 						if a := tag.Artist(); a != "" {
 							artist = a
 						}
-						tag.Close()
 					}
-					os.Remove(tagPath)
+				} else if ext == ".wav" {
+					if tagReader := extractWavID3FromBytes(buf); tagReader != nil {
+						tag, err := id3v2.ParseReader(tagReader, id3v2.Options{Parse: true})
+						if err == nil {
+							if t := tag.Title(); t != "" {
+								title = t
+							}
+							if a := tag.Artist(); a != "" {
+								artist = a
+							}
+						}
+					}
 				}
 			}
-			os.Remove(tmpPath)
 		}
 
 		songs = append(songs, Song{
@@ -327,17 +246,27 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmpPath, err := downloadFullFileToDisk(context.TODO(), songName)
+	// Para las carátulas leemos un rango mayor (1 MB) directamente en memoria RAM sin usar archivos temporales en disco
+	res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(songName),
+		Range:  aws.String("bytes=0-1048576"),
+	})
 	if err != nil {
 		http.Error(w, "No cover found", http.StatusNotFound)
 		return
 	}
-	defer os.Remove(tmpPath)
+	defer res.Body.Close()
+
+	buf, err := io.ReadAll(res.Body)
+	if err != nil {
+		http.Error(w, "No cover found", http.StatusNotFound)
+		return
+	}
 
 	if ext == ".mp3" {
-		tag, err := id3v2.Open(tmpPath, id3v2.Options{Parse: true})
+		tag, err := id3v2.ParseReader(bytes.NewReader(buf), id3v2.Options{Parse: true})
 		if err == nil {
-			defer tag.Close()
 			pictures := tag.GetFrames(tag.CommonID("Attached picture"))
 			for _, f := range pictures {
 				if pic, ok := f.(id3v2.PictureFrame); ok {
@@ -348,12 +277,9 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else if ext == ".wav" {
-		tagPath := extractWavID3TagFile(tmpPath)
-		if tagPath != "" {
-			defer os.Remove(tagPath)
-			tag, err := id3v2.Open(tagPath, id3v2.Options{Parse: true})
+		if tagReader := extractWavID3FromBytes(buf); tagReader != nil {
+			tag, err := id3v2.ParseReader(tagReader, id3v2.Options{Parse: true})
 			if err == nil {
-				defer tag.Close()
 				pictures := tag.GetFrames(tag.CommonID("Attached picture"))
 				for _, f := range pictures {
 					if pic, ok := f.(id3v2.PictureFrame); ok {
@@ -365,26 +291,25 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else if ext == ".flac" {
-		fBytes, err := os.ReadFile(tmpPath)
-		if err == nil && len(fBytes) > 4 && string(fBytes[:4]) == "fLaC" {
+		if len(buf) > 4 && string(buf[:4]) == "fLaC" {
 			offset := 4
-			for offset < len(fBytes) {
-				if offset+4 > len(fBytes) {
+			for offset < len(buf) {
+				if offset+4 > len(buf) {
 					break
 				}
-				header := fBytes[offset]
+				header := buf[offset]
 				isLast := (header & 0x80) != 0
 				blockType := header & 0x7F
 
-				length := int(fBytes[offset+1])<<16 | int(fBytes[offset+2])<<8 | int(fBytes[offset+3])
+				length := int(buf[offset+1])<<16 | int(buf[offset+2])<<8 | int(buf[offset+3])
 				offset += 4
 
-				if offset+length > len(fBytes) {
+				if offset+length > len(buf) {
 					break
 				}
 
 				if blockType == 6 {
-					blockData := fBytes[offset : offset+length]
+					blockData := buf[offset : offset+length]
 					for i := 0; i < len(blockData)-4; i++ {
 						if (blockData[i] == 0xFF && blockData[i+1] == 0xD8) ||
 							(blockData[i] == 0x89 && blockData[i+1] == 0x50 && blockData[i+2] == 0x4E && blockData[i+3] == 0x47) {
