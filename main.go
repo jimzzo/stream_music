@@ -96,38 +96,15 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		headRes, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
-			Bucket: aws.String(bucketName),
-			Key:    aws.String(name),
-		})
-		
-		var fileSize int64 = 0
-		if err == nil && headRes.ContentLength != nil {
-			fileSize = *headRes.ContentLength
-		}
+		log.Printf("[DEBUG] Analizando archivo completo en R2: '%s'", name)
 
-		log.Printf("[DEBUG] Analizando archivo: '%s' | Tamaño: %d bytes", name, fileSize)
-
-		// Como R2 no permite rangos múltiples con comas, descargamos los ÚLTIMOS 2 MB del archivo 
-		// que es exactamente donde Mp3tag guarda los metadatos y carátulas en los WAV gigantes.
-		var rangeStr string
-		if fileSize > 2097152 {
-			start := fileSize - 2097152
-			rangeStr = fmt.Sprintf("bytes=%d-%d", start, fileSize-1)
-		} else if fileSize > 0 {
-			rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
-		} else {
-			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
-			continue
-		}
-
+		// Descargamos el objeto completo (tal como lo hacías en local) para asegurar lectura íntegra de metadatos
 		res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(name),
-			Range:  aws.String(rangeStr),
 		})
 		if err != nil {
-			log.Printf("[DEBUG ERROR] Falló rango en %s: %v", name, err)
+			log.Printf("[DEBUG ERROR] No se pudo descargar %s de R2: %v", name, err)
 			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
 			continue
 		}
@@ -139,7 +116,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Abrimos el bloque final con id3v2
+		// Creamos archivo temporal con el contenido completo para el lector ID3
 		tmpFile, err := os.CreateTemp("", "meta-*.tmp")
 		if err == nil {
 			tmpName := tmpFile.Name()
@@ -160,7 +137,7 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 					artist = a
 				}
 			} else {
-				log.Printf("[ID3V2 WARN] No se detectó ID3 al final de %s: %v", name, err)
+				log.Printf("[ID3V2 WARN] id3v2.Open falló para %s: %v", name, err)
 			}
 		}
 
@@ -222,31 +199,9 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	headRes, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
-		Bucket: aws.String(bucketName),
-		Key:    aws.String(songName),
-	})
-	
-	var fileSize int64 = 0
-	if err == nil && headRes.ContentLength != nil {
-		fileSize = *headRes.ContentLength
-	}
-
-	var rangeStr string
-	if fileSize > 2097152 {
-		start := fileSize - 2097152
-		rangeStr = fmt.Sprintf("bytes=%d-%d", start, fileSize-1)
-	} else if fileSize > 0 {
-		rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
-	} else {
-		http.Error(w, "No cover found", http.StatusNotFound)
-		return
-	}
-
 	res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(songName),
-		Range:  aws.String(rangeStr),
 	})
 	if err != nil {
 		http.Error(w, "No cover found", http.StatusNotFound)
