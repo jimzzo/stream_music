@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -28,12 +27,11 @@ type Song struct {
 }
 
 var (
-	s3Client   *s3.Client
-	bucketName string
-	
-	cacheMutex   sync.Mutex
-	cachedSongs  []Song
-	cacheLoaded  = false
+	s3Client    *s3.Client
+	bucketName  string
+	cacheMutex  sync.Mutex
+	cachedSongs []Song
+	cacheLoaded = false
 )
 
 func initS3() {
@@ -79,66 +77,8 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Extrae el bloque ID3v2 interno de un archivo WAV con contenedor RIFF
-func extractWavID3Chunk(filePath string) string {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return ""
-	}
-	defer file.Close()
-
-	// Leer cabecera RIFF (12 bytes: "RIFF" + size + "WAVE")
-	header := make([]byte, 12)
-	if _, err := io.ReadFull(file, header); err != nil {
-		return ""
-	}
-
-	if string(header[:4]) != "RIFF" || string(header[8:]) != "WAVE" {
-		return ""
-	}
-
-	// Buscar chunks iterativamente dentro del RIFF
-	for {
-		chunkHeader := make([]byte, 8)
-		if _, err := io.ReadFull(file, chunkHeader); err != nil {
-			break
-		}
-
-		chunkID := string(chunkHeader[:4])
-		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
-
-		// Los chunks de metadatos ID3 en archivos WAV suelen llamarse "id3 " o "ID3 "
-		if chunkID == "id3 " || chunkID == "ID3 " {
-			id3Data := make([]byte, chunkSize)
-			if _, err := io.ReadFull(file, id3Data); err != nil {
-				break
-			}
-
-			// Escribir el bloque ID3 extraído a un archivo temporal puro para que id3v2 lo lea sin problemas
-			tmpTagFile, err := os.CreateTemp("", "wav-id3-*.tmp")
-			if err != nil {
-				return ""
-			}
-			tmpTagPath := tmpTagFile.Name()
-			tmpTagFile.Write(id3Data)
-			tmpTagFile.Close()
-			return tmpTagPath
-		}
-
-		// Saltar al siguiente chunk (asegurando alineación par en RIFF)
-		toSkip := int64(chunkSize)
-		if toSkip%2 != 0 {
-			toSkip++
-		}
-		if _, err := file.Seek(toSkip, io.SeekCurrent); err != nil {
-			break
-		}
-	}
-	return ""
-}
-
-// Descarga el archivo completo a un disco temporal por streaming (seguro para RAM en Render) y devuelve la ruta del archivo temporal
-func downloadToTempFile(ctx context.Context, key string) (string, error) {
+// Descarga cualquier archivo completo a un disco temporal mediante streaming (cero RAM, seguro contra OOM)
+func downloadFullFileToDisk(ctx context.Context, key string) (string, error) {
 	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(key),
@@ -165,6 +105,58 @@ func downloadToTempFile(ctx context.Context, key string) (string, error) {
 	return tmpName, nil
 }
 
+// Extrae el bloque ID3v2 incrustado dentro del contenedor RIFF de un archivo WAV
+func extractWavID3TagFile(wavFilePath string) string {
+	file, err := os.Open(wavFilePath)
+	if err != nil {
+		return ""
+	}
+	defer file.Close()
+
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(file, header); err != nil {
+		return ""
+	}
+	if string(header[:4]) != "RIFF" || string(header[8:]) != "WAVE" {
+		return ""
+	}
+
+	for {
+		chunkHeader := make([]byte, 8)
+		if _, err := io.ReadFull(file, chunkHeader); err != nil {
+			break
+		}
+
+		chunkID := string(chunkHeader[:4])
+		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
+
+		if chunkID == "id3 " || chunkID == "ID3 " {
+			id3Data := make([]byte, chunkSize)
+			if _, err := io.ReadFull(file, id3Data); err != nil {
+				break
+			}
+
+			tmpTagFile, err := os.CreateTemp("", "wav-id3-*.tmp")
+			if err != nil {
+				return ""
+			}
+			tmpTagPath := tmpTagFile.Name()
+			tmpTagFile.Write(id3Data)
+			tmpTagFile.Close()
+			return tmpTagPath
+		}
+
+		toSkip := int64(chunkSize)
+		if toSkip%2 != 0 {
+			toSkip++
+		}
+		if _, err := file.Seek(toSkip, io.SeekCurrent); err != nil {
+			break
+		}
+	}
+	return ""
+}
+
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -173,7 +165,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 
 	cacheMutex.Lock()
 	if cacheLoaded {
-		log.Println("[CACHE] Sirviendo lista de canciones desde la memoria caché.")
 		cacheMutex.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(cachedSongs)
@@ -181,7 +172,6 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	}
 	cacheMutex.Unlock()
 
-	log.Println("[CACHE] Escaneando canciones en Cloudflare R2 por primera vez...")
 	output, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucketName),
 	})
@@ -202,39 +192,36 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		// Descargamos el archivo completo a disco temporal para asegurar carátulas e integridad total
-		tmpPath, err := downloadToTempFile(context.TODO(), name)
+		tmpPath, err := downloadFullFileToDisk(context.TODO(), name)
 		if err == nil {
-			defer os.Remove(tmpPath)
-
 			if ext == ".mp3" {
 				tag, err := id3v2.Open(tmpPath, id3v2.Options{Parse: true})
 				if err == nil {
-					defer tag.Close()
 					if t := tag.Title(); t != "" {
 						title = t
 					}
 					if a := tag.Artist(); a != "" {
 						artist = a
 					}
+					tag.Close()
 				}
 			} else if ext == ".wav" {
-				// Parseo especializado para WAV con RIFF ID3v2.3
-				tagPath := extractWavID3Chunk(tmpPath)
+				tagPath := extractWavID3TagFile(tmpPath)
 				if tagPath != "" {
-					defer os.Remove(tagPath)
 					tag, err := id3v2.Open(tagPath, id3v2.Options{Parse: true})
 					if err == nil {
-						defer tag.Close()
 						if t := tag.Title(); t != "" {
 							title = t
 						}
 						if a := tag.Artist(); a != "" {
 							artist = a
 						}
+						tag.Close()
 					}
+					os.Remove(tagPath)
 				}
 			}
+			os.Remove(tmpPath)
 		}
 
 		songs = append(songs, Song{
@@ -300,8 +287,7 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Descargar archivo completo a disco temporal para que las imágenes grandes no salgan cortadas
-	tmpPath, err := downloadToTempFile(context.TODO(), songName)
+	tmpPath, err := downloadFullFileToDisk(context.TODO(), songName)
 	if err != nil {
 		http.Error(w, "No cover found", http.StatusNotFound)
 		return
@@ -322,7 +308,7 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	} else if ext == ".wav" {
-		tagPath := extractWavID3Chunk(tmpPath)
+		tagPath := extractWavID3TagFile(tmpPath)
 		if tagPath != "" {
 			defer os.Remove(tagPath)
 			tag, err := id3v2.Open(tagPath, id3v2.Options{Parse: true})
