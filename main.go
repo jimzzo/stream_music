@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
@@ -24,8 +25,15 @@ type Song struct {
 	Artista string `json:"artista"`
 }
 
-var s3Client *s3.Client
-var bucketName string
+var (
+	s3Client   *s3.Client
+	bucketName string
+	
+	// Variables para la Caché en Memoria y evitar bloqueos concurrentes
+	cacheMutex   sync.Mutex
+	cachedSongs  []Song
+	cacheLoaded  = false
+)
 
 func initS3() {
 	bucketName = os.Getenv("R2_BUCKET_NAME")
@@ -76,6 +84,18 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Protegemos la caché con Mutex para que múltiples usuarios concurrentes no disparen el escaneo a la vez
+	cacheMutex.Lock()
+	if cacheLoaded {
+		log.Println("[CACHE] Sirviendo lista de canciones desde la memoria caché (Instantáneo).")
+		cacheMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(cachedSongs)
+		return
+	}
+	cacheMutex.Unlock()
+
+	log.Println("[CACHE] Primera vez: escaneando canciones en Cloudflare R2...")
 	output, err := s3Client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucketName),
 	})
@@ -96,52 +116,55 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 		title := strings.TrimSuffix(name, ext)
 		artist := "Cloud Library"
 
-		log.Printf("[DEBUG] Descargando y analizando archivo completo: '%s'", name)
-
-		// Descargamos el objeto COMPLETO de R2 (exactamente como en local para respetar el formato RIFF ID3v2.3)
-		res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+		headRes, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
 			Bucket: aws.String(bucketName),
 			Key:    aws.String(name),
 		})
-		if err != nil {
-			log.Printf("[DEBUG ERROR] No se pudo descargar %s de R2: %v", name, err)
-			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
-			continue
+		
+		var fileSize int64 = 0
+		if err == nil && headRes.ContentLength != nil {
+			fileSize = *headRes.ContentLength
 		}
 
-		// Usamos un archivo temporal y hacemos streaming a disco con io.Copy 
-		// (cero uso de RAM, evitando el error de Out Of Memory en Render)
-		tmpFile, err := os.CreateTemp("", "meta-*.tmp")
-		if err != nil {
-			res.Body.Close()
-			songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
-			continue
+		// Descargamos únicamente los primeros 2 MB por streaming a disco (ahorra RAM y vuela)
+		rangeStr := "bytes=0-2097152"
+		if fileSize > 0 && fileSize < 2097152 {
+			rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
 		}
 
-		tmpName := tmpFile.Name()
-		_, copyErr := io.Copy(tmpFile, res.Body)
-		res.Body.Close()
-		tmpFile.Close()
-
-		if copyErr == nil {
-			tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
+		res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    aws.String(name),
+			Range:  aws.String(rangeStr),
+		})
+		
+		if err == nil {
+			tmpFile, err := os.CreateTemp("", "meta-*.tmp")
 			if err == nil {
-				defer tag.Close()
-				t := tag.Title()
-				a := tag.Artist()
-				log.Printf("[ID3V2 OK] %s -> Título: '%s' | Artista: '%s'", name, t, a)
-				if t != "" {
-					title = t
-				}
-				if a != "" {
-					artist = a
+				tmpName := tmpFile.Name()
+				_, copyErr := io.Copy(tmpFile, res.Body)
+				res.Body.Close()
+				tmpFile.Close()
+				defer os.Remove(tmpName)
+
+				if copyErr == nil {
+					tag, err := id3v2.Open(tmpName, id3v2.Options{Parse: true})
+					if err == nil {
+						defer tag.Close()
+						t := tag.Title()
+						a := tag.Artist()
+						if t != "" {
+							title = t
+						}
+						if a != "" {
+							artist = a
+						}
+					}
 				}
 			} else {
-				log.Printf("[ID3V2 WARN] id3v2.Open falló para %s: %v", name, err)
+				res.Body.Close()
 			}
 		}
-
-		os.Remove(tmpName)
 
 		songs = append(songs, Song{
 			Nombre:  name,
@@ -149,6 +172,12 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 			Artista: artist,
 		})
 	}
+
+	// Guardamos el resultado en la caché global
+	cacheMutex.Lock()
+	cachedSongs = songs
+	cacheLoaded = true
+	cacheMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(songs)
@@ -201,9 +230,25 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	headRes, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(songName),
+	})
+	
+	var fileSize int64 = 0
+	if err == nil && headRes.ContentLength != nil {
+		fileSize = *headRes.ContentLength
+	}
+
+	rangeStr := "bytes=0-2097152"
+	if fileSize > 0 && fileSize < 2097152 {
+		rangeStr = fmt.Sprintf("bytes=0-%d", fileSize-1)
+	}
+
 	res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(songName),
+		Range:  aws.String(rangeStr),
 	})
 	if err != nil {
 		http.Error(w, "No cover found", http.StatusNotFound)
