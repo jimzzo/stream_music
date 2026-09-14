@@ -172,7 +172,8 @@
     .album-art-container img {
         width: 100%;
         height: 100%;
-        object-fit: contain; /* Ajustado para mostrar la carátula completa sin recortes */
+        object-fit: cover; /* Llena todo el contenedor (recorta bordes si la proporción no es cuadrada) */
+        object-position: center;
         display: none;
         background-color: #111;
     }
@@ -646,3 +647,5 @@
 
     loadSongs();
 </script>
+</body>
+</html>
