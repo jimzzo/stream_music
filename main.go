@@ -12,11 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/bogem/id3v2/v2"
 )
 
@@ -26,33 +28,45 @@ type Song struct {
 	Artista string `json:"artista"`
 }
 
+// ManifestEntry es lo que se guarda en R2 (_manifest/manifest.json) para no
+// tener que volver a extraer metadatos de un archivo que no ha cambiado.
+type ManifestEntry struct {
+	Nombre   string `json:"nombre"`
+	Titulo   string `json:"titulo"`
+	Artista  string `json:"artista"`
+	ETag     string `json:"etag"`
+	CoverKey string `json:"coverKey,omitempty"`
+}
+
 const (
 	// Rango leído para MP3/FLAC (el tag/los bloques de metadatos van al principio)
 	headFetchSize int64 = 2 * 1024 * 1024 // 2MB
 	// Rango leído para WAV (Serato/rekordbox/Traktor suelen meter el chunk id3
 	// DESPUÉS del audio, casi al final del archivo)
 	tailFetchSize int64 = 3 * 1024 * 1024 // 3MB
-	// Rango ligero usado solo para el escaneo inicial de /songs
+	// Rango ligero usado solo para leer título/artista (más barato que el de carátula)
 	scanHeadSize int64 = 512 * 1024
 	scanTailSize int64 = 512 * 1024
+
+	manifestKey = "_manifest/manifest.json"
+	coverPrefix = "_manifest/covers/"
+
+	reconcileInterval = 10 * time.Minute
 )
 
 var (
-	s3Client    *s3.Client
-	bucketName  string
+	s3Client   *s3.Client
+	bucketName string
+
 	cacheMutex  sync.Mutex
 	cachedSongs []Song
 	cacheLoaded bool
 
-	coverCacheMutex sync.Mutex
-	coverCache      = map[string]coverCacheEntry{}
-)
+	manifestMutex sync.Mutex
+	manifestCache = map[string]ManifestEntry{}
 
-type coverCacheEntry struct {
-	mime  string
-	data  []byte
-	found bool
-}
+	reconcileMutex sync.Mutex
+)
 
 func initS3() {
 	bucketName = os.Getenv("R2_BUCKET_NAME")
@@ -97,7 +111,7 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// --- Utilidades de lectura parcial contra R2/S3 ---
+// --- Utilidades de lectura/escritura parcial contra R2/S3 ---
 
 func fetchRange(ctx context.Context, key string, rangeHeader string) ([]byte, error) {
 	input := &s3.GetObjectInput{
@@ -115,20 +129,42 @@ func fetchRange(ctx context.Context, key string, rangeHeader string) ([]byte, er
 	return io.ReadAll(res.Body)
 }
 
-func getObjectSize(ctx context.Context, key string) (int64, error) {
+func getObjectInfo(ctx context.Context, key string) (size int64, etag string, err error) {
 	head, err := s3Client.HeadObject(ctx, &s3.HeadObjectInput{
 		Bucket: aws.String(bucketName),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return aws.ToInt64(head.ContentLength), nil
+	return aws.ToInt64(head.ContentLength), aws.ToString(head.ETag), nil
 }
 
-// findID3Signature busca la firma real de un tag ID3v2 ("ID3" + byte de versión
-// 2/3/4) dentro de un buffer de bytes. No depende de que el chunk "id3 " de WAV
-// esté bien alineado: busca el tag ID3v2 en sí, esté donde esté.
+func listAllObjects(ctx context.Context) ([]types.Object, error) {
+	var all []types.Object
+	var token *string
+	for {
+		out, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucketName),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, out.Contents...)
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	return all, nil
+}
+
+// --- Extracción de metadatos ID3 / FLAC ---
+
+// findID3Signature busca la firma real de un tag ID3v2 ("ID3" + byte de
+// versión 2/3/4) dentro de un buffer de bytes. No depende de que el chunk
+// "id3 " de WAV esté bien alineado: busca el tag ID3v2 en sí, esté donde esté.
 func findID3Signature(data []byte) int {
 	search := []byte("ID3")
 	start := 0
@@ -223,6 +259,233 @@ func extractFlacPictureFromBytes(data []byte) (mime string, pic []byte) {
 	return "", nil
 }
 
+func extractTitleArtist(ctx context.Context, name, ext string, size int64) (title, artist string) {
+	title = strings.TrimSuffix(name, ext)
+	artist = "Cloud Library"
+
+	head, err := fetchRange(ctx, name, fmt.Sprintf("bytes=0-%d", scanHeadSize-1))
+	if err == nil {
+		if t, a, ok := parseID3TitleArtist(head); ok {
+			if t != "" {
+				title = t
+			}
+			if a != "" {
+				artist = a
+			}
+			return
+		}
+	}
+
+	if ext == ".wav" && size > 0 {
+		start := size - scanTailSize
+		if start < 0 {
+			start = 0
+		}
+		if tail, terr := fetchRange(ctx, name, fmt.Sprintf("bytes=%d-%d", start, size-1)); terr == nil {
+			if t, a, ok := parseID3TitleArtist(tail); ok {
+				if t != "" {
+					title = t
+				}
+				if a != "" {
+					artist = a
+				}
+			}
+		}
+	}
+
+	return
+}
+
+func extractCoverBytes(ctx context.Context, name, ext string, size int64) (mime string, pic []byte) {
+	switch ext {
+	case ".mp3":
+		if head, err := fetchRange(ctx, name, fmt.Sprintf("bytes=0-%d", headFetchSize-1)); err == nil {
+			mime, pic = extractPictureFromID3Bytes(head)
+		}
+	case ".wav":
+		if size > 0 {
+			start := size - tailFetchSize
+			if start < 0 {
+				start = 0
+			}
+			if tail, err := fetchRange(ctx, name, fmt.Sprintf("bytes=%d-%d", start, size-1)); err == nil {
+				mime, pic = extractPictureFromID3Bytes(tail)
+			}
+		}
+		if pic == nil {
+			if head, err := fetchRange(ctx, name, fmt.Sprintf("bytes=0-%d", headFetchSize-1)); err == nil {
+				mime, pic = extractPictureFromID3Bytes(head)
+			}
+		}
+	case ".flac":
+		if head, err := fetchRange(ctx, name, fmt.Sprintf("bytes=0-%d", headFetchSize-1)); err == nil {
+			mime, pic = extractFlacPictureFromBytes(head)
+		}
+	}
+	return
+}
+
+func coverKeyFor(name, mime string) string {
+	ext := ".jpg"
+	if mime == "image/png" {
+		ext = ".png"
+	}
+	safe := strings.NewReplacer("/", "_", " ", "_").Replace(name)
+	return coverPrefix + safe + ext
+}
+
+// --- Manifiesto persistido en R2 ---
+
+func loadManifest(ctx context.Context) map[string]ManifestEntry {
+	manifest := map[string]ManifestEntry{}
+	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(manifestKey),
+	})
+	if err != nil {
+		return manifest // no existe todavía (primer arranque) o error de red: empezamos de cero
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return manifest
+	}
+	var entries []ManifestEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return manifest
+	}
+	for _, e := range entries {
+		manifest[e.Nombre] = e
+	}
+	return manifest
+}
+
+func saveManifest(ctx context.Context, manifest map[string]ManifestEntry) error {
+	entries := make([]ManifestEntry, 0, len(manifest))
+	for _, e := range manifest {
+		entries = append(entries, e)
+	}
+	data, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      aws.String(bucketName),
+		Key:         aws.String(manifestKey),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String("application/json"),
+	})
+	return err
+}
+
+func persistManifestAsync() {
+	manifestMutex.Lock()
+	snapshot := make(map[string]ManifestEntry, len(manifestCache))
+	for k, v := range manifestCache {
+		snapshot[k] = v
+	}
+	manifestMutex.Unlock()
+	if err := saveManifest(context.Background(), snapshot); err != nil {
+		log.Println("No se pudo guardar el manifest en R2:", err)
+	}
+}
+
+// reconcileLibrary compara el bucket con el manifest guardado en R2 y solo
+// procesa (extrae metadatos/carátula) los archivos nuevos o modificados,
+// detectando cambios por ETag. Completamente automático: se llama sola al
+// arrancar, cada reconcileInterval en segundo plano, y de forma perezosa la
+// primera vez que alguien pide /songs.
+func reconcileLibrary(ctx context.Context) {
+	reconcileMutex.Lock()
+	defer reconcileMutex.Unlock()
+
+	if s3Client == nil {
+		return
+	}
+
+	objects, err := listAllObjects(ctx)
+	if err != nil {
+		log.Println("Reconcile: error listando el bucket:", err)
+		return
+	}
+
+	oldManifest := loadManifest(ctx)
+	newManifest := make(map[string]ManifestEntry, len(objects))
+	var songs []Song
+	changed := false
+
+	for _, obj := range objects {
+		name := aws.ToString(obj.Key)
+		if strings.HasPrefix(name, coverPrefix) || name == manifestKey {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(name))
+		if strings.Contains(name, "Multipart") || (ext != ".mp3" && ext != ".flac" && ext != ".wav") {
+			continue
+		}
+
+		etag := aws.ToString(obj.ETag)
+		size := aws.ToInt64(obj.Size)
+
+		if existing, ok := oldManifest[name]; ok && existing.ETag == etag {
+			newManifest[name] = existing
+			songs = append(songs, Song{Nombre: name, Titulo: existing.Titulo, Artista: existing.Artista})
+			continue
+		}
+
+		// Archivo nuevo o modificado desde la última reconciliación: procesarlo.
+		changed = true
+		title, artist := extractTitleArtist(ctx, name, ext, size)
+		mime, pic := extractCoverBytes(ctx, name, ext, size)
+
+		coverKey := ""
+		if pic != nil {
+			coverKey = coverKeyFor(name, mime)
+			if _, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket:      aws.String(bucketName),
+				Key:         aws.String(coverKey),
+				Body:        bytes.NewReader(pic),
+				ContentType: aws.String(mime),
+			}); err != nil {
+				log.Println("Reconcile: no se pudo guardar la carátula de", name, ":", err)
+				coverKey = ""
+			}
+		}
+
+		newManifest[name] = ManifestEntry{Nombre: name, Titulo: title, Artista: artist, ETag: etag, CoverKey: coverKey}
+		songs = append(songs, Song{Nombre: name, Titulo: title, Artista: artist})
+	}
+
+	// Limpieza: canciones que ya no están en el bucket (borradas) pierden su
+	// carátula huérfana y su entrada en el manifest.
+	for key, old := range oldManifest {
+		if _, ok := newManifest[key]; !ok {
+			changed = true
+			if old.CoverKey != "" {
+				_, _ = s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{
+					Bucket: aws.String(bucketName),
+					Key:    aws.String(old.CoverKey),
+				})
+			}
+		}
+	}
+
+	cacheMutex.Lock()
+	cachedSongs = songs
+	cacheLoaded = true
+	cacheMutex.Unlock()
+
+	manifestMutex.Lock()
+	manifestCache = newManifest
+	manifestMutex.Unlock()
+
+	if changed {
+		if err := saveManifest(ctx, newManifest); err != nil {
+			log.Println("Reconcile: no se pudo guardar el manifest:", err)
+		}
+	}
+}
+
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -230,84 +493,18 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheMutex.Lock()
-	if cacheLoaded {
-		cacheMutex.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(cachedSongs)
-		return
-	}
+	loaded := cacheLoaded
 	cacheMutex.Unlock()
 
-	ctx := context.TODO()
-
-	output, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucketName),
-	})
-	if err != nil {
-		http.Error(w, "Error al listar canciones de la nube: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	var songs []Song
-	for _, obj := range output.Contents {
-		name := aws.ToString(obj.Key)
-		ext := strings.ToLower(filepath.Ext(name))
-
-		if strings.Contains(name, "Multipart") || (ext != ".mp3" && ext != ".flac" && ext != ".wav") {
-			continue
-		}
-
-		title := strings.TrimSuffix(name, ext)
-		artist := "Cloud Library"
-		size := aws.ToInt64(obj.Size)
-
-		// Lectura ligera en RAM para el escaneo inicial
-		head, err := fetchRange(ctx, name, fmt.Sprintf("bytes=0-%d", scanHeadSize-1))
-		if err == nil && len(head) > 0 {
-			switch ext {
-			case ".mp3":
-				if t, a, ok := parseID3TitleArtist(head); ok {
-					if t != "" {
-						title = t
-					}
-					if a != "" {
-						artist = a
-					}
-				}
-			case ".wav":
-				t, a, ok := parseID3TitleArtist(head)
-				if !ok && size > 0 {
-					// El id3 casi siempre queda al final en grabaciones largas de DJ,
-					// fuera del rango de cabecera que acabamos de leer.
-					start := size - scanTailSize
-					if start < 0 {
-						start = 0
-					}
-					if tail, terr := fetchRange(ctx, name, fmt.Sprintf("bytes=%d-%d", start, size-1)); terr == nil {
-						t, a, ok = parseID3TitleArtist(tail)
-					}
-				}
-				if ok {
-					if t != "" {
-						title = t
-					}
-					if a != "" {
-						artist = a
-					}
-				}
-			}
-		}
-
-		songs = append(songs, Song{
-			Nombre:  name,
-			Titulo:  title,
-			Artista: artist,
-		})
+	if !loaded {
+		// Primera vez desde que arrancó el servidor: reconcilia ya mismo para
+		// poder responder con datos completos (las siguientes veces esto ya
+		// está resuelto por el ticker en segundo plano).
+		reconcileLibrary(r.Context())
 	}
 
 	cacheMutex.Lock()
-	cachedSongs = songs
-	cacheLoaded = true
+	songs := cachedSongs
 	cacheMutex.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -353,66 +550,71 @@ func playSong(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, result.Body)
 }
 
-// getCover ya NO descarga el archivo completo: pide solo el rango donde
-// realmente suele vivir el tag/los metadatos, y cachea el resultado en memoria
-// para que las siguientes peticiones de la misma canción sean instantáneas.
+func serveObject(ctx context.Context, w http.ResponseWriter, key string) bool {
+	res, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	if res.ContentType != nil {
+		w.Header().Set("Content-Type", *res.ContentType)
+	}
+	io.Copy(w, res.Body)
+	return true
+}
+
+// getCover sirve la carátula ya indexada en el manifest (una simple lectura
+// de un archivo de imagen pequeño en R2, sin tocar el audio). Si la canción
+// es tan nueva que todavía no pasó por reconcileLibrary, la extrae al vuelo
+// y la dejar registrada para que la próxima petición ya sea instantánea.
 func getCover(w http.ResponseWriter, r *http.Request) {
 	songName := r.URL.Query().Get("song")
-	ext := strings.ToLower(filepath.Ext(songName))
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
 		return
 	}
+	ctx := r.Context()
 
-	coverCacheMutex.Lock()
-	if cached, ok := coverCache[songName]; ok {
-		coverCacheMutex.Unlock()
-		if !cached.found {
+	manifestMutex.Lock()
+	entry, known := manifestCache[songName]
+	manifestMutex.Unlock()
+
+	if known {
+		if entry.CoverKey == "" {
 			http.Error(w, "No cover found", http.StatusNotFound)
 			return
 		}
-		w.Header().Set("Content-Type", cached.mime)
-		w.Write(cached.data)
-		return
+		if serveObject(ctx, w, entry.CoverKey) {
+			return
+		}
+		// La carátula desapareció de R2 por algún motivo: seguimos al fallback.
 	}
-	coverCacheMutex.Unlock()
 
-	ctx := context.TODO()
-	var mime string
-	var pic []byte
+	ext := strings.ToLower(filepath.Ext(songName))
+	size, etag, _ := getObjectInfo(ctx, songName)
+	mime, pic := extractCoverBytes(ctx, songName, ext, size)
 
-	switch ext {
-	case ".mp3":
-		if head, err := fetchRange(ctx, songName, fmt.Sprintf("bytes=0-%d", headFetchSize-1)); err == nil {
-			mime, pic = extractPictureFromID3Bytes(head)
-		}
-
-	case ".wav":
-		if size, err := getObjectSize(ctx, songName); err == nil {
-			start := size - tailFetchSize
-			if start < 0 {
-				start = 0
-			}
-			if tail, terr := fetchRange(ctx, songName, fmt.Sprintf("bytes=%d-%d", start, size-1)); terr == nil {
-				mime, pic = extractPictureFromID3Bytes(tail)
-			}
-		}
-		if pic == nil {
-			// Fallback por si algún WAV concreto sí lo trae al principio
-			if head, err := fetchRange(ctx, songName, fmt.Sprintf("bytes=0-%d", headFetchSize-1)); err == nil {
-				mime, pic = extractPictureFromID3Bytes(head)
-			}
-		}
-
-	case ".flac":
-		if head, err := fetchRange(ctx, songName, fmt.Sprintf("bytes=0-%d", headFetchSize-1)); err == nil {
-			mime, pic = extractFlacPictureFromBytes(head)
+	coverKey := ""
+	if pic != nil {
+		coverKey = coverKeyFor(songName, mime)
+		if _, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(bucketName),
+			Key:         aws.String(coverKey),
+			Body:        bytes.NewReader(pic),
+			ContentType: aws.String(mime),
+		}); err != nil {
+			coverKey = ""
 		}
 	}
 
-	coverCacheMutex.Lock()
-	coverCache[songName] = coverCacheEntry{mime: mime, data: pic, found: pic != nil}
-	coverCacheMutex.Unlock()
+	title, artist := extractTitleArtist(ctx, songName, ext, size)
+	manifestMutex.Lock()
+	manifestCache[songName] = ManifestEntry{Nombre: songName, Titulo: title, Artista: artist, ETag: etag, CoverKey: coverKey}
+	manifestMutex.Unlock()
+	go persistManifestAsync()
 
 	if pic == nil {
 		http.Error(w, "No cover found", http.StatusNotFound)
@@ -424,6 +626,19 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initS3()
+
+	if s3Client != nil {
+		// Reconciliación inicial en segundo plano (no bloquea el arranque del
+		// servidor) y refresco periódico automático, sin intervención manual.
+		go reconcileLibrary(context.Background())
+		go func() {
+			ticker := time.NewTicker(reconcileInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				reconcileLibrary(context.Background())
+			}
+		}()
+	}
 
 	http.HandleFunc("/songs", enableCORS(getSongs))
 	http.HandleFunc("/play", enableCORS(playSong))
