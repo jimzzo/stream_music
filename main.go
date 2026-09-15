@@ -695,6 +695,42 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
+var lovenseHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
+// lovensePostJSON manda un POST con pinta de navegador real (User-Agent,
+// Accept...) en vez de las cabeceras por defecto de Go, que Cloudflare
+// suele usar para distinguir scripts de tráfico normal y responder con
+// una página de verificación en vez del JSON esperado.
+func lovensePostJSON(url string, payload interface{}) ([]byte, error) {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+	resp, err := lovenseHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
+}
+
+// isCloudflareChallenge detecta si Lovense (o el Cloudflare que tienen
+// delante) respondió con la página de verificación anti-bots en vez del
+// JSON esperado, para poder dar un mensaje de error claro en vez de
+// volcar todo el HTML de esa página.
+func isCloudflareChallenge(body []byte) bool {
+	s := string(body)
+	return strings.Contains(s, "Just a moment") || strings.Contains(s, "cf_chl") || strings.Contains(s, "challenges.cloudflare.com")
+}
+
 // lovenseGetQR pide un código QR nuevo a Lovense (usando nuestro token
 // secreto, que nunca llega al navegador) y devuelve al navegador solo el
 // uid de la sesión y la imagen del QR.
@@ -712,23 +748,19 @@ func lovenseGetQR(w http.ResponseWriter, r *http.Request) {
 	sum := md5.Sum([]byte(uid + lovenseSalt))
 	utoken := hex.EncodeToString(sum[:])
 
-	payload, _ := json.Marshal(map[string]interface{}{
+	respBody, err := lovensePostJSON(lovenseQRURL, map[string]interface{}{
 		"token":  lovenseDevToken,
 		"uid":    uid,
 		"uname":  "Reproductor de sesiones",
 		"utoken": utoken,
 		"v":      2,
 	})
-
-	resp, err := http.Post(lovenseQRURL, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		http.Error(w, "No se pudo contactar con Lovense: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		http.Error(w, "Error leyendo la respuesta de Lovense", http.StatusBadGateway)
+	if isCloudflareChallenge(respBody) {
+		http.Error(w, "Lovense bloqueó la petición con su verificación anti-bots (Cloudflare). Prueba de nuevo en un momento.", http.StatusBadGateway)
 		return
 	}
 
@@ -821,7 +853,7 @@ func lovenseVibrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]interface{}{
+	respBody, err := lovensePostJSON("https://api.lovense.com/api/lan/v2/command", map[string]interface{}{
 		"token":   lovenseDevToken,
 		"uid":     uid,
 		"command": "Function",
@@ -829,15 +861,16 @@ func lovenseVibrate(w http.ResponseWriter, r *http.Request) {
 		"timeSec": 1,
 		"apiVer":  1,
 	})
-
-	resp, err := http.Post("https://api.lovense.com/api/lan/v2/command", "application/json", bytes.NewReader(payload))
 	if err != nil {
 		http.Error(w, "No se pudo contactar con Lovense: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	if isCloudflareChallenge(respBody) {
+		http.Error(w, "Lovense bloqueó la petición con su verificación anti-bots (Cloudflare)", http.StatusBadGateway)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	io.Copy(w, resp.Body)
+	w.Write(respBody)
 }
 
 func main() {
