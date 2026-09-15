@@ -478,7 +478,7 @@
         padding: 10px 12px;
         font-size: 0.76rem;
         color: var(--text-secondary);
-        width: 210px;
+        width: 260px;
         text-align: left;
         line-height: 1.4;
         display: none;
@@ -1046,9 +1046,15 @@
             showToyNote('Conectado. Buscando juguetes por Bluetooth…', 5000);
         } catch (err) {
             console.error('ToySync:', err);
-            showToyNote(
-                'No se encontró Intiface Central. <a href="https://intiface.com/central" target="_blank" rel="noopener">Descárgalo aquí</a> (gratis), ábrelo, pulsa "Start Server" y vuelve a intentar.'
-            );
+            const detail = (err && err.message) ? err.message : String(err);
+            const lower = detail.toLowerCase();
+            let hint;
+            if (lower.includes('permission') || lower.includes('not allowed') || lower.includes('notallowed')) {
+                hint = 'Chrome pidió permiso para acceder a tu red local y no lo concediste (o lo bloqueó). Pulsa el candado/ícono junto a la URL → Permisos del sitio → Red local → Permitir, y vuelve a intentar.';
+            } else {
+                hint = `No se encontró Intiface Central. <a href="https://intiface.com/central" target="_blank" rel="noopener">Descárgalo aquí</a> (gratis), ábrelo, pulsa "Start Server" y vuelve a intentar.`;
+            }
+            showToyNote(`${hint}<br><span style="opacity:.65">Detalle técnico: ${escapeHtml(detail)}</span>`);
         } finally {
             toySwitch.disabled = false;
         }
