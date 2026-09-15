@@ -441,6 +441,33 @@
         cursor: wait;
     }
 
+    .toy-help-btn {
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid var(--border);
+        color: var(--text-secondary);
+        font-size: 0.68rem;
+        line-height: 1;
+        cursor: pointer;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        transition: color 0.15s, background 0.15s;
+    }
+
+    .toy-help-btn:hover {
+        color: var(--text);
+        background: rgba(255, 255, 255, 0.15);
+    }
+
+    .toy-note a {
+        color: var(--accent-cyan);
+        text-decoration: underline;
+    }
+
     .toy-note {
         position: absolute;
         bottom: calc(100% + 10px);
@@ -534,6 +561,7 @@
 
             <div class="toy-sync">
                 <span class="toy-sync-label">Sincronizar juguete</span>
+                <button id="toy-help" class="toy-help-btn" type="button" title="¿Qué necesito para esto?" aria-label="Ayuda sobre sincronizar juguete">?</button>
                 <button id="toy-switch" class="toy-switch" role="switch" aria-checked="false" title="Sincronizar juguete al ritmo"></button>
                 <div id="toy-note" class="toy-note">Necesita Intiface Central abierto en este dispositivo, con el servidor iniciado (puerto 12345). Nada de esto pasa por nuestro servidor: la conexión es directa entre esta página y tu Intiface Central.</div>
             </div>
@@ -729,6 +757,7 @@
     const ringCanvas = document.getElementById('ring-canvas');
     const ringCtx = ringCanvas.getContext('2d');
     const toySwitch = document.getElementById('toy-switch');
+    const toyHelp = document.getElementById('toy-help');
     const toyNote = document.getElementById('toy-note');
 
     let previousVolume = 1;
@@ -941,9 +970,23 @@
     // verdad contra Intiface Central corriendo en este dispositivo.
     // ---------------------------------------------------------------
     const INTIFACE_ADDRESS = 'ws://127.0.0.1:12345';
+    const INTIFACE_HELP_HTML =
+        'Para que el juguete vibre con la música necesitas <strong>Intiface Central</strong>, una app gratuita (de intiface.com, no nuestra) que hace de puente entre el Bluetooth del juguete y esta página.<br><br>' +
+        '1. <a href="https://intiface.com/central" target="_blank" rel="noopener">Descárgala aquí</a> e instálala en este mismo dispositivo.<br>' +
+        '2. Ábrela y pulsa "Start Server".<br>' +
+        '3. Enciende el juguete y activa el interruptor de al lado.';
 
-    function showToyNote(text, autoHideMs) {
-        toyNote.textContent = text;
+    let toyNoteMode = null; // 'help' | null — para saber si el panel de ayuda está fijo o es un mensaje de estado
+
+    function escapeHtml(str) {
+        return String(str).replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+    }
+
+    function showToyNote(html, autoHideMs) {
+        toyNoteMode = null;
+        toyNote.innerHTML = html;
         toyNote.classList.add('visible');
         clearTimeout(toyNote._hideTimer);
         if (autoHideMs) {
@@ -951,13 +994,25 @@
         }
     }
 
+    toyHelp.onclick = () => {
+        clearTimeout(toyNote._hideTimer);
+        if (toyNote.classList.contains('visible') && toyNoteMode === 'help') {
+            toyNote.classList.remove('visible');
+            toyNoteMode = null;
+            return;
+        }
+        toyNoteMode = 'help';
+        toyNote.innerHTML = INTIFACE_HELP_HTML;
+        toyNote.classList.add('visible');
+    };
+
     ToySync.setStatusListener((status, detail) => {
         if (status === 'connected') {
             showToyNote('Conectado a Intiface Central. Buscando juguetes por Bluetooth…', 5000);
         } else if (status === 'device-added') {
-            showToyNote(`Detectado: ${detail}. Ya vibra al ritmo de los graves.`, 5000);
+            showToyNote(`Detectado: ${escapeHtml(detail)}. Ya vibra al ritmo de los graves.`, 5000);
         } else if (status === 'device-removed') {
-            showToyNote(`Se desconectó: ${detail}.`, 5000);
+            showToyNote(`Se desconectó: ${escapeHtml(detail)}.`, 5000);
         } else if (status === 'disconnected') {
             toySyncEnabled = false;
             toySwitch.classList.remove('on');
@@ -991,7 +1046,9 @@
             showToyNote('Conectado. Buscando juguetes por Bluetooth…', 5000);
         } catch (err) {
             console.error('ToySync:', err);
-            showToyNote('No se encontró Intiface Central. Ábrelo en este dispositivo, pulsa "Start Server" y vuelve a intentar.');
+            showToyNote(
+                'No se encontró Intiface Central. <a href="https://intiface.com/central" target="_blank" rel="noopener">Descárgalo aquí</a> (gratis), ábrelo, pulsa "Start Server" y vuelve a intentar.'
+            );
         } finally {
             toySwitch.disabled = false;
         }
