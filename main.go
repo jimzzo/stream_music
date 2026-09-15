@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -629,8 +632,180 @@ func getCover(w http.ResponseWriter, r *http.Request) {
 	w.Write(pic)
 }
 
+// ---------------------------------------------------------------------
+// Integración con la Standard API de Lovense (lovense.com/user/developer).
+// El navegador habla DIRECTO con la app Lovense Remote del usuario por
+// HTTPS (vía lan.js, cargado en el propio index.html) — nuestro servidor
+// solo hace de intermediario para dos cosas que no pueden pasar por el
+// navegador: pedir el código QR (necesita el token secreto) y recibir el
+// aviso de "ya escaneado" que la app de Lovense manda por su cuenta a
+// nuestro Callback URL. A partir de ahí, los comandos de vibración van
+// directos navegador → app, sin tocar Render en cada golpe de graves.
+// ---------------------------------------------------------------------
+
+const lovenseQRURL = "https://api.lovense.com/api/lan/getQrCode"
+
+type lovenseSession struct {
+	data json.RawMessage
+	ts   time.Time
+}
+
+var (
+	lovenseDevToken string
+	lovenseSalt     string
+
+	lovenseMutex    sync.Mutex
+	lovenseSessions = map[string]lovenseSession{}
+)
+
+func initLovense() {
+	lovenseDevToken = os.Getenv("LOVENSE_DEV_TOKEN")
+	if lovenseDevToken == "" {
+		log.Println("Aviso: LOVENSE_DEV_TOKEN no configurado; la sincronización de juguete Lovense no funcionará.")
+	}
+	salt, err := randomHex(16)
+	if err != nil {
+		log.Println("Aviso: no se pudo generar la sal para Lovense:", err)
+		salt = "sal-de-respaldo-no-critica"
+	}
+	lovenseSalt = salt
+
+	// Limpieza periódica de sesiones nunca escaneadas, para no acumular memoria.
+	go func() {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cutoff := time.Now().Add(-2 * time.Hour)
+			lovenseMutex.Lock()
+			for k, v := range lovenseSessions {
+				if v.ts.Before(cutoff) {
+					delete(lovenseSessions, k)
+				}
+			}
+			lovenseMutex.Unlock()
+		}
+	}()
+}
+
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+// lovenseGetQR pide un código QR nuevo a Lovense (usando nuestro token
+// secreto, que nunca llega al navegador) y devuelve al navegador solo el
+// uid de la sesión y la imagen del QR.
+func lovenseGetQR(w http.ResponseWriter, r *http.Request) {
+	if lovenseDevToken == "" {
+		http.Error(w, "Lovense no configurado en el servidor (falta LOVENSE_DEV_TOKEN)", http.StatusInternalServerError)
+		return
+	}
+
+	uid, err := randomHex(12)
+	if err != nil {
+		http.Error(w, "Error generando la sesión", http.StatusInternalServerError)
+		return
+	}
+	sum := md5.Sum([]byte(uid + lovenseSalt))
+	utoken := hex.EncodeToString(sum[:])
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"token":  lovenseDevToken,
+		"uid":    uid,
+		"uname":  "Reproductor de sesiones",
+		"utoken": utoken,
+		"v":      2,
+	})
+
+	resp, err := http.Post(lovenseQRURL, "application/json", bytes.NewReader(payload))
+	if err != nil {
+		http.Error(w, "No se pudo contactar con Lovense: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		http.Error(w, "Error leyendo la respuesta de Lovense", http.StatusBadGateway)
+		return
+	}
+
+	var parsed struct {
+		Result bool `json:"result"`
+		Data   struct {
+			QR   string `json:"qr"`
+			Code string `json:"code"`
+		} `json:"data"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(respBody, &parsed); err != nil || !parsed.Result {
+		http.Error(w, "Respuesta inesperada de Lovense: "+string(respBody), http.StatusBadGateway)
+		return
+	}
+
+	lovenseMutex.Lock()
+	lovenseSessions[uid] = lovenseSession{ts: time.Now()} // reserva el hueco; sin datos todavía
+	lovenseMutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"uid": uid,
+		"qr":  parsed.Data.QR,
+	})
+}
+
+// lovenseCallback recibe el aviso que la app Lovense Remote manda a
+// nuestro servidor (configurado como Callback URL en el panel de Lovense)
+// en cuanto el usuario escanea el QR y confirma.
+func lovenseCallback(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	var parsed struct {
+		UID string `json:"uid"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil || parsed.UID == "" {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	lovenseMutex.Lock()
+	lovenseSessions[parsed.UID] = lovenseSession{data: json.RawMessage(body), ts: time.Now()}
+	lovenseMutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"result": true, "message": "success"})
+}
+
+// lovenseStatus lo consulta el navegador (sondeo cada pocos segundos)
+// hasta que aparecen los datos que dejó lovenseCallback.
+func lovenseStatus(w http.ResponseWriter, r *http.Request) {
+	uid := r.URL.Query().Get("uid")
+	if uid == "" {
+		http.Error(w, "falta uid", http.StatusBadRequest)
+		return
+	}
+
+	lovenseMutex.Lock()
+	sess, ok := lovenseSessions[uid]
+	lovenseMutex.Unlock()
+
+	if !ok || sess.data == nil {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(sess.data)
+}
+
 func main() {
 	initS3()
+	initLovense()
 
 	if s3Client != nil {
 		// Reconciliación inicial en segundo plano (no bloquea el arranque del
@@ -648,6 +823,9 @@ func main() {
 	http.HandleFunc("/songs", enableCORS(getSongs))
 	http.HandleFunc("/play", enableCORS(playSong))
 	http.HandleFunc("/cover", enableCORS(getCover))
+	http.HandleFunc("/api/lovense/qr", enableCORS(lovenseGetQR))
+	http.HandleFunc("/api/lovense/callback", enableCORS(lovenseCallback))
+	http.HandleFunc("/api/lovense/status", enableCORS(lovenseStatus))
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
 	port := os.Getenv("PORT")
