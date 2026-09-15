@@ -3,101 +3,137 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mi Reproductor de Música</title>
+    <title>Mi Reproductor de Sesiones</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
 
-   <style>
+    <style>
     :root {
-        --bg-color: #0b0b0b;
-        --surface-color: rgba(24, 24, 24, 0.75);
-        --surface-hover: #282828;
-        --primary-color: #1db954;
-        --text-color: #ffffff;
-        --text-secondary: #b3b3b3;
+        --bg: #0a0710;
+        --bg-2: #150a20;
+        --surface: rgba(26, 15, 38, 0.55);
+        --surface-strong: rgba(26, 15, 38, 0.82);
+        --border: rgba(255, 255, 255, 0.08);
+        --accent: #ff2e88;
+        --accent-2: #7c3aed;
+        --accent-cyan: #00e0ff;
+        --warm: #ffb74a;
+        --text: #f5eefb;
+        --text-secondary: #9c8fb5;
     }
 
     * {
         box-sizing: border-box;
         margin: 0;
         padding: 0;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        font-family: "Space Grotesk", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         user-select: none;
         -webkit-user-select: none;
         -moz-user-select: none;
     }
 
+    html, body {
+        background-color: var(--bg);
+        color: var(--text);
+    }
+
     body {
-        background-color: var(--bg-color);
-        color: var(--text-color);
         display: flex;
         height: 100vh;
         overflow: hidden;
     }
 
+    /* ---------- Sidebar / tracklist ---------- */
+
     .sidebar {
-        width: 340px;
-        background-color: rgba(0, 0, 0, 0.85);
-        backdrop-filter: blur(15px);
-        -webkit-backdrop-filter: blur(15px);
+        width: 320px;
+        background-color: rgba(6, 3, 10, 0.9);
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
         display: flex;
         flex-direction: column;
-        border-right: 1px solid rgba(255, 255, 255, 0.05);
+        border-right: 1px solid var(--border);
         z-index: 2;
     }
 
-    .sidebar h2 {
-        padding: 22px 20px;
-        font-size: 1.1rem;
-        letter-spacing: 0.5px;
-        color: var(--text-color);
-        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    .sidebar-header {
+        padding: 26px 22px 18px 22px;
+        border-bottom: 1px solid var(--border);
     }
 
-    .playlist {
+    .sidebar-header .kicker {
+        font-size: 0.72rem;
+        color: var(--text-secondary);
+        letter-spacing: 0.02em;
+    }
+
+    .sidebar-header h1 {
+        font-family: "Unbounded", "Space Grotesk", sans-serif;
+        font-weight: 700;
+        font-size: 1.15rem;
+        margin-top: 4px;
+        line-height: 1.3;
+    }
+
+    .tracklist {
         list-style: none;
         overflow-y: auto;
         flex: 1;
-        padding: 10px;
+        padding: 8px 10px;
     }
 
-    .playlist::-webkit-scrollbar {
+    .tracklist::-webkit-scrollbar {
         width: 6px;
     }
-    .playlist::-webkit-scrollbar-thumb {
-        background: #333;
+    .tracklist::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.12);
         border-radius: 3px;
     }
 
-    .playlist li {
-        padding: 12px 15px;
-        margin-bottom: 6px;
-        border-radius: 8px;
+    .tracklist li {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 11px 12px;
+        margin-bottom: 2px;
+        border-radius: 10px;
         cursor: pointer;
         color: var(--text-secondary);
         font-size: 0.9rem;
-        transition: background 0.2s, color 0.2s;
+        transition: background 0.15s, color 0.15s;
+    }
+
+    .tracklist li:hover {
+        background-color: rgba(255, 255, 255, 0.05);
+        color: var(--text);
+    }
+
+    .tracklist li.active {
+        background: linear-gradient(90deg, rgba(255, 46, 136, 0.18), rgba(124, 58, 237, 0.1));
+        color: var(--text);
+    }
+
+    .track-num {
+        font-variant-numeric: tabular-nums;
+        font-size: 0.78rem;
+        color: var(--text-secondary);
+        width: 20px;
+        flex-shrink: 0;
+    }
+
+    .tracklist li.active .track-num {
+        color: var(--accent);
+    }
+
+    .track-name {
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        display: flex;
-        align-items: center;
-        gap: 12px;
     }
 
-    .playlist li i {
-        font-size: 0.8rem;
-    }
-
-    .playlist li:hover {
-        background-color: var(--surface-hover);
-        color: var(--text-color);
-    }
-
-    .playlist li.active {
-        background-color: var(--surface-hover);
-        color: var(--primary-color);
-        font-weight: 600;
-    }
+    /* ---------- Main stage ---------- */
 
     .main-container {
         flex: 1;
@@ -106,113 +142,108 @@
         justify-content: center;
         align-items: center;
         padding: 40px;
-        background: radial-gradient(circle at center, #1c1c1c 0%, var(--bg-color) 100%);
         position: relative;
         overflow: hidden;
     }
 
-    .ambient-background {
+    .ambient-bg {
         position: absolute;
-        width: 650px;
-        height: 650px;
-        background: linear-gradient(135deg, rgba(29, 185, 84, 0.18), rgba(0, 0, 0, 0));
-        border-radius: 50%;
-        filter: blur(90px);
+        inset: -20%;
+        background:
+            radial-gradient(circle at 30% 25%, rgba(255, 46, 136, 0.22), transparent 45%),
+            radial-gradient(circle at 75% 70%, rgba(124, 58, 237, 0.24), transparent 50%),
+            radial-gradient(circle at 50% 100%, rgba(0, 224, 255, 0.08), transparent 55%);
+        filter: blur(70px);
         z-index: 0;
-        animation: pulseGlow 8s ease-in-out infinite alternate;
+        animation: driftGlow 14s ease-in-out infinite alternate;
         pointer-events: none;
     }
 
-    @keyframes pulseGlow {
-        0% {
-            transform: scale(0.85) translate(-40px, -40px);
-            opacity: 0.4;
-        }
-        100% {
-            transform: scale(1.25) translate(40px, 40px);
-            opacity: 0.8;
-        }
+    @keyframes driftGlow {
+        0%   { transform: scale(1) translate(0, 0); }
+        100% { transform: scale(1.15) translate(3%, -3%); }
     }
 
-    .player-card {
-        background-color: var(--surface-color);
-        backdrop-filter: blur(24px);
-        -webkit-backdrop-filter: blur(24px);
-        padding: 35px 35px 45px 35px;
-        border-radius: 20px;
-        width: 100%;
-        max-width: 440px;
-        box-shadow: 0 20px 50px rgba(0,0,0,0.7);
-        text-align: center;
+    @media (prefers-reduced-motion: reduce) {
+        .ambient-bg { animation: none; }
+    }
+
+    .stage {
         position: relative;
         z-index: 1;
-        border: 1px solid rgba(255, 255, 255, 0.08);
+        width: 100%;
+        max-width: 460px;
+        text-align: center;
+    }
+
+    /* ---------- Art + visualizer ring ---------- */
+
+    .art-stage {
+        position: relative;
+        width: 260px;
+        height: 260px;
+        margin: 0 auto 28px auto;
+    }
+
+    #ring-canvas {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
     }
 
     .album-art-container {
+        position: absolute;
+        top: 25px;
+        left: 25px;
         width: 210px;
         height: 210px;
-        margin: 0 auto 24px auto;
-        border-radius: 14px;
+        border-radius: 18px;
         overflow: hidden;
-        background-color: #222;
-        box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+        background-color: #161022;
+        box-shadow: 0 0 0 1px var(--border), 0 20px 45px rgba(0, 0, 0, 0.55);
         display: flex;
         align-items: center;
         justify-content: center;
-        position: relative;
-        transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-    }
-
-    .album-art-container.playing {
-        transform: scale(1.04);
-        box-shadow: 0 15px 35px rgba(29, 185, 84, 0.25);
+        transition: box-shadow 0.2s;
     }
 
     .album-art-container img {
         width: 100%;
         height: 100%;
-        object-fit: cover; /* Llena todo el contenedor (recorta bordes si la proporción no es cuadrada) */
+        object-fit: cover;
         object-position: center;
         display: none;
-        background-color: #111;
     }
 
     .album-art-placeholder {
-        font-size: 4rem;
+        font-size: 3.6rem;
         color: var(--text-secondary);
     }
 
+    /* ---------- Song info ---------- */
+
     .song-info {
-        margin-bottom: 24px;
+        margin-bottom: 26px;
         overflow: hidden;
-        text-align: left;
-        padding: 0 5px;
     }
 
     .marquee-container {
         width: 100%;
         overflow: hidden;
         white-space: nowrap;
-        position: relative;
     }
 
     .song-title {
-        font-size: 1.3rem;
+        font-family: "Unbounded", "Space Grotesk", sans-serif;
         font-weight: 700;
-        margin-bottom: 6px;
+        font-size: 1.5rem;
         display: inline-block;
     }
 
     .song-title.marquee {
-        display: inline-block;
         padding-left: 100%;
-        animation: marqueeAnim 12s linear infinite;
-    }
-
-    .song-artist {
-        color: var(--text-secondary);
-        font-size: 0.9rem;
+        animation: marqueeAnim 13s linear infinite;
     }
 
     @keyframes marqueeAnim {
@@ -220,28 +251,35 @@
         100% { transform: translate(-100%, 0); }
     }
 
-    /* Barra de progreso interactiva (Seekbar con soporte de arrastre) */
+    .song-artist {
+        color: var(--text-secondary);
+        font-size: 0.92rem;
+        margin-top: 6px;
+    }
+
+    /* ---------- Progress ---------- */
+
     .progress-container {
         width: 100%;
-        background-color: rgba(255, 255, 255, 0.1);
-        height: 8px;
-        border-radius: 4px;
+        background-color: rgba(255, 255, 255, 0.08);
+        height: 6px;
+        border-radius: 3px;
         cursor: pointer;
         margin-bottom: 8px;
         position: relative;
         overflow: visible;
-        transition: height 0.2s;
+        transition: height 0.15s;
     }
 
     .progress-container:hover {
-        height: 10px;
+        height: 8px;
     }
 
     .progress-bar {
-        background-color: var(--primary-color);
+        background: linear-gradient(90deg, var(--accent-2), var(--accent));
         height: 100%;
         width: 0%;
-        border-radius: 4px;
+        border-radius: 3px;
         position: relative;
     }
 
@@ -255,8 +293,8 @@
         height: 12px;
         background-color: #fff;
         border-radius: 50%;
-        transition: transform 0.2s;
-        box-shadow: 0 0 5px rgba(0,0,0,0.5);
+        transition: transform 0.15s;
+        box-shadow: 0 0 8px rgba(255, 46, 136, 0.7);
     }
 
     .progress-container:hover .progress-bar::after,
@@ -267,16 +305,20 @@
     .time-info {
         display: flex;
         justify-content: space-between;
-        font-size: 0.75rem;
+        font-size: 0.74rem;
         color: var(--text-secondary);
-        margin-bottom: 20px;
+        font-variant-numeric: tabular-nums;
+        margin-bottom: 26px;
     }
+
+    /* ---------- Controls ---------- */
 
     .controls {
         display: flex;
         justify-content: center;
         align-items: center;
-        gap: 30px;
+        gap: 28px;
+        margin-bottom: 26px;
     }
 
     .btn {
@@ -284,44 +326,51 @@
         border: none;
         color: var(--text-secondary);
         cursor: pointer;
-        font-size: 1.4rem;
-        transition: color 0.2s, transform 0.15s;
+        font-size: 1.3rem;
+        transition: color 0.15s, transform 0.15s;
     }
 
     .btn:hover {
-        color: var(--text-color);
-        transform: scale(1.12);
+        color: var(--text);
+        transform: scale(1.1);
     }
 
-    .btn:focus, button:focus, input:focus {
-        outline: none;
+    .btn:focus-visible, button:focus-visible, input:focus-visible {
+        outline: 2px solid var(--accent-cyan);
+        outline-offset: 3px;
     }
 
     .btn-play {
-        background-color: var(--primary-color);
-        color: #000;
-        width: 58px;
-        height: 58px;
+        background: var(--warm);
+        color: #1a0f00;
+        width: 60px;
+        height: 60px;
         border-radius: 50%;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 1.3rem;
-        box-shadow: 0 6px 20px rgba(29, 185, 84, 0.45);
-        transition: transform 0.15s, background-color 0.2s;
+        font-size: 1.25rem;
+        box-shadow: 0 8px 24px rgba(255, 183, 74, 0.35);
+        transition: transform 0.15s, box-shadow 0.15s;
         cursor: pointer;
+        border: none;
     }
 
     .btn-play:hover {
-        background-color: #1ed760;
-        color: #000;
-        transform: scale(1.07);
+        transform: scale(1.06);
+        box-shadow: 0 10px 30px rgba(255, 183, 74, 0.5);
+    }
+
+    /* ---------- Footer row: volumen + sync juguete ---------- */
+
+    .footer-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
     }
 
     .volume-container {
-        position: absolute;
-        bottom: 15px;
-        left: 20px;
         display: flex;
         align-items: center;
         gap: 8px;
@@ -334,10 +383,78 @@
     .volume-slider {
         width: 80px;
         height: 4px;
-        accent-color: var(--primary-color);
+        accent-color: var(--accent);
         cursor: pointer;
-        background: rgba(255,255,255,0.2);
+        background: rgba(255, 255, 255, 0.15);
         border-radius: 2px;
+    }
+
+    .toy-sync {
+        display: flex;
+        align-items: center;
+        gap: 9px;
+        position: relative;
+    }
+
+    .toy-sync-label {
+        font-size: 0.78rem;
+        color: var(--text-secondary);
+        white-space: nowrap;
+    }
+
+    .toy-switch {
+        width: 38px;
+        height: 22px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid var(--border);
+        cursor: pointer;
+        position: relative;
+        transition: background 0.2s;
+        flex-shrink: 0;
+    }
+
+    .toy-switch::after {
+        content: '';
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--text-secondary);
+        transition: transform 0.2s, background 0.2s;
+    }
+
+    .toy-switch.on {
+        background: linear-gradient(90deg, var(--accent-2), var(--accent));
+        border-color: transparent;
+    }
+
+    .toy-switch.on::after {
+        transform: translateX(16px);
+        background: #fff;
+    }
+
+    .toy-note {
+        position: absolute;
+        bottom: calc(100% + 10px);
+        right: 0;
+        background: var(--surface-strong);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 10px 12px;
+        font-size: 0.76rem;
+        color: var(--text-secondary);
+        width: 210px;
+        text-align: left;
+        line-height: 1.4;
+        display: none;
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+    }
+
+    .toy-note.visible {
+        display: block;
     }
 
     @media (max-width: 768px) {
@@ -348,43 +465,46 @@
         }
         .sidebar {
             width: 100%;
-            max-height: 180px;
+            max-height: 170px;
             border-right: none;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            border-bottom: 1px solid var(--border);
         }
         .main-container {
             flex: 1;
-            padding: 20px;
+            padding: 24px 20px;
             justify-content: flex-start;
         }
-        .player-card {
-            max-width: 100%;
-            padding: 20px 20px 45px 20px;
-        }
     }
-</style>
-
+    </style>
+</head>
+<body>
 
 <div class="sidebar">
-    <h2><i class="fa-solid fa-music"></i> Mi Biblioteca</h2>
-    <ul id="playlist" class="playlist"></ul>
+    <div class="sidebar-header">
+        <div class="kicker">Cloudflare R2</div>
+        <h1>Tus sesiones</h1>
+    </div>
+    <ul id="playlist" class="tracklist"></ul>
 </div>
 
 <div class="main-container">
-    <div class="ambient-background"></div>
+    <div class="ambient-bg"></div>
 
-    <div class="player-card">
-        
-        <div id="art-container" class="album-art-container">
-            <i id="art-placeholder" class="fa-solid fa-compact-disc album-art-placeholder"></i>
-            <img id="album-art" alt="Carátula">
+    <div class="stage">
+
+        <div class="art-stage">
+            <canvas id="ring-canvas" width="260" height="260"></canvas>
+            <div id="art-container" class="album-art-container">
+                <i id="art-placeholder" class="fa-solid fa-compact-disc album-art-placeholder"></i>
+                <img id="album-art" alt="Carátula">
+            </div>
         </div>
 
         <div class="song-info">
             <div class="marquee-container">
                 <div id="song-title" class="song-title">Cargando música...</div>
             </div>
-            <div id="song-artist" class="song-artist">Cloudflare R2</div>
+            <div id="song-artist" class="song-artist">&nbsp;</div>
         </div>
 
         <div id="progress-container" class="progress-container">
@@ -401,9 +521,17 @@
             <button id="next-btn" class="btn" title="Siguiente"><i class="fa-solid fa-forward-step"></i></button>
         </div>
 
-        <div class="volume-container">
-            <button id="mute-btn" class="btn" title="Silenciar"><i class="fa-solid fa-volume-high" id="volume-icon"></i></button>
-            <input type="range" id="volume-slider" class="volume-slider" min="0" max="1" step="0.01" value="1">
+        <div class="footer-row">
+            <div class="volume-container">
+                <button id="mute-btn" class="btn" title="Silenciar"><i class="fa-solid fa-volume-high" id="volume-icon"></i></button>
+                <input type="range" id="volume-slider" class="volume-slider" min="0" max="1" step="0.01" value="1">
+            </div>
+
+            <div class="toy-sync">
+                <span class="toy-sync-label">Sincronizar juguete</span>
+                <button id="toy-switch" class="toy-switch" role="switch" aria-checked="false" title="Sincronizar juguete al ritmo"></button>
+                <div id="toy-note" class="toy-note">Esta función se conecta en el próximo paso (vía Intiface Central, en tu propio dispositivo). Por ahora solo queda guardada tu preferencia.</div>
+            </div>
         </div>
 
     </div>
@@ -412,6 +540,54 @@
 <audio id="audio-element"></audio>
 
 <script>
+    // ---------------------------------------------------------------
+    // Motor de audio compartido: un único AnalyserNode que alimenta
+    // tanto el visualizador en anillo como (más adelante) la
+    // sincronización del juguete. Cualquier otra parte de la interfaz
+    // puede suscribirse con AudioEngine.subscribe(fn) sin duplicar el
+    // grafo de Web Audio.
+    // ---------------------------------------------------------------
+    const AudioEngine = (() => {
+        let audioCtx = null;
+        let analyser = null;
+        let dataArray = null;
+        let listeners = [];
+        let rafId = null;
+
+        function ensureContext(audioElement) {
+            if (audioCtx) return;
+            const Ctx = window.AudioContext || window.webkitAudioContext;
+            if (!Ctx) return; // navegador sin Web Audio: la interfaz sigue funcionando sin visualizador
+            audioCtx = new Ctx();
+            const source = audioCtx.createMediaElementSource(audioElement);
+            analyser = audioCtx.createAnalyser();
+            analyser.fftSize = 256;
+            analyser.smoothingTimeConstant = 0.75;
+            dataArray = new Uint8Array(analyser.frequencyBinCount);
+            source.connect(analyser);
+            analyser.connect(audioCtx.destination);
+            loop();
+        }
+
+        function resume() {
+            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+        }
+
+        function loop() {
+            rafId = requestAnimationFrame(loop);
+            if (!analyser) return;
+            analyser.getByteFrequencyData(dataArray);
+            listeners.forEach(fn => fn(dataArray));
+        }
+
+        function subscribe(fn) {
+            listeners.push(fn);
+            return () => { listeners = listeners.filter(l => l !== fn); };
+        }
+
+        return { ensureContext, resume, subscribe };
+    })();
+
     let songs = [];
     let currentIndex = 0;
     let isDragging = false;
@@ -434,14 +610,20 @@
     const albumArtImg = document.getElementById('album-art');
     const artPlaceholder = document.getElementById('art-placeholder');
     const artContainer = document.getElementById('art-container');
+    const ringCanvas = document.getElementById('ring-canvas');
+    const ringCtx = ringCanvas.getContext('2d');
+    const toySwitch = document.getElementById('toy-switch');
+    const toyNote = document.getElementById('toy-note');
 
     let previousVolume = 1;
+    let toySyncEnabled = false;
+    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
     async function loadSongs() {
         try {
             const response = await fetch('/songs');
             if (!response.ok) throw new Error("Error en el servidor HTTP: " + response.status);
-            
+
             songs = await response.json();
             renderPlaylist();
 
@@ -460,33 +642,29 @@
         playlistElement.innerHTML = '';
         songs.forEach((song, index) => {
             const li = document.createElement('li');
-            li.innerHTML = `<i class="fa-solid fa-music"></i> ${song.titulo}`;
+            const num = String(index + 1).padStart(2, '0');
+            li.innerHTML = `<span class="track-num">${num}</span><span class="track-name">${song.titulo}</span>`;
             li.onclick = () => playSong(index);
             playlistElement.appendChild(li);
         });
+        updateActiveItem();
     }
 
     function updateActiveItem() {
         const items = playlistElement.querySelectorAll('li');
         items.forEach((item, index) => {
-            if (index === currentIndex) {
-                item.classList.add('active');
-                item.querySelector('i').className = "fa-solid fa-volume-high";
-            } else {
-                item.classList.remove('active');
-                item.querySelector('i').className = "fa-solid fa-music";
-            }
+            item.classList.toggle('active', index === currentIndex);
         });
     }
 
     function prepareSong(index) {
         currentIndex = index;
         const song = songs[index];
-        
+
         songTitleEl.innerText = song.titulo;
         songArtistEl.innerText = song.artista;
-        
-        if (song.titulo.length > 25) {
+
+        if (song.titulo.length > 28) {
             songTitleEl.classList.add('marquee');
         } else {
             songTitleEl.classList.remove('marquee');
@@ -511,31 +689,31 @@
 
     function playSong(index) {
         prepareSong(index);
+        AudioEngine.ensureContext(audioElement);
+        AudioEngine.resume();
         audioElement.play().then(() => {
             playIcon.className = "fa-solid fa-pause";
-            artContainer.classList.add('playing');
         }).catch(err => console.error("Error al reproducir:", err));
     }
 
     playBtn.onclick = () => {
         if (songs.length === 0) return;
+        AudioEngine.ensureContext(audioElement);
+        AudioEngine.resume();
         if (audioElement.paused) {
             if (!audioElement.src || audioElement.src === "") prepareSong(currentIndex);
             audioElement.play().then(() => {
                 playIcon.className = "fa-solid fa-pause";
-                artContainer.classList.add('playing');
             }).catch(err => console.error(err));
         } else {
             audioElement.pause();
             playIcon.className = "fa-solid fa-play";
-            artContainer.classList.remove('playing');
         }
     };
 
     nextBtn.onclick = () => { if (songs.length > 0) playSong((currentIndex + 1) % songs.length); };
     prevBtn.onclick = () => { if (songs.length > 0) playSong((currentIndex - 1 + songs.length) % songs.length); };
 
-    // Actualización de progreso fluida (si no se está arrastrando)
     audioElement.ontimeupdate = () => {
         if (!isDragging && audioElement.duration) {
             const percent = (audioElement.currentTime / audioElement.duration) * 100;
@@ -545,7 +723,6 @@
         }
     };
 
-    // Lógica completa de Seekbar interactiva por Arrastre (Drag & Drop) y Clic
     function getSeekTime(e) {
         const rect = progressContainer.getBoundingClientRect();
         const clientX = e.clientX || (e.touches && e.touches[0].clientX) || 0;
@@ -580,7 +757,6 @@
         audioElement.currentTime = time;
     };
 
-    // Soporte táctil para móviles / tablets
     progressContainer.ontouchstart = (e) => {
         if (!audioElement.duration) return;
         isDragging = true;
@@ -601,7 +777,6 @@
         if (!isDragging || !audioElement.duration) return;
         isDragging = false;
         progressContainer.classList.remove('dragging');
-        // En touchend e.clientX no viene en el evento window, tomamos la última posición táctil
         const touch = e.changedTouches && e.changedTouches[0];
         if (touch) {
             const rect = progressContainer.getBoundingClientRect();
@@ -644,6 +819,64 @@
         const secs = Math.floor(seconds % 60);
         return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
     }
+
+    // ---------------------------------------------------------------
+    // Interruptor de "Sincronizar juguete": por ahora solo guarda la
+    // preferencia y muestra una nota. La conexión real a Intiface
+    // Central se añade en el siguiente paso.
+    // ---------------------------------------------------------------
+    toySwitch.onclick = () => {
+        toySyncEnabled = !toySyncEnabled;
+        toySwitch.classList.toggle('on', toySyncEnabled);
+        toySwitch.setAttribute('aria-checked', String(toySyncEnabled));
+        toyNote.classList.add('visible');
+        clearTimeout(toySwitch._hideTimer);
+        toySwitch._hideTimer = setTimeout(() => toyNote.classList.remove('visible'), 4000);
+    };
+
+    // ---------------------------------------------------------------
+    // Visualizador en anillo: barras radiales alrededor de la carátula,
+    // impulsadas por el mismo AnalyserNode del AudioEngine.
+    // ---------------------------------------------------------------
+    function drawRing(dataArray) {
+        const w = ringCanvas.width, h = ringCanvas.height;
+        ringCtx.clearRect(0, 0, w, h);
+        if (!dataArray || prefersReducedMotion) return;
+
+        const cx = w / 2, cy = h / 2;
+        const baseRadius = 112;
+        const barCount = 56;
+        const step = Math.floor(dataArray.length / barCount) || 1;
+
+        for (let i = 0; i < barCount; i++) {
+            const value = dataArray[i * step] / 255;
+            const angle = (i / barCount) * Math.PI * 2 - Math.PI / 2;
+            const barLength = 4 + value * 40;
+            const x1 = cx + Math.cos(angle) * baseRadius;
+            const y1 = cy + Math.sin(angle) * baseRadius;
+            const x2 = cx + Math.cos(angle) * (baseRadius + barLength);
+            const y2 = cy + Math.sin(angle) * (baseRadius + barLength);
+
+            ringCtx.strokeStyle = value > 0.6
+                ? `rgba(0, 224, 255, ${0.5 + value * 0.5})`
+                : `rgba(255, 46, 136, ${0.35 + value * 0.5})`;
+            ringCtx.lineWidth = 3;
+            ringCtx.lineCap = 'round';
+            ringCtx.beginPath();
+            ringCtx.moveTo(x1, y1);
+            ringCtx.lineTo(x2, y2);
+            ringCtx.stroke();
+        }
+
+        // Brillo suave en la carátula acorde a la energía de graves
+        let bassSum = 0;
+        for (let i = 0; i < 6; i++) bassSum += dataArray[i];
+        const bass = bassSum / (6 * 255);
+        artContainer.style.boxShadow =
+            `0 0 0 1px var(--border), 0 20px 45px rgba(0,0,0,0.55), 0 0 ${18 + bass * 40}px rgba(255, 46, 136, ${0.15 + bass * 0.35})`;
+    }
+
+    AudioEngine.subscribe(drawRing);
 
     loadSongs();
 </script>
