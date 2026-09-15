@@ -402,6 +402,21 @@
         white-space: nowrap;
     }
 
+    .toy-level {
+        font-size: 0.72rem;
+        font-variant-numeric: tabular-nums;
+        color: var(--accent-cyan);
+        min-width: 30px;
+        text-align: center;
+        white-space: nowrap;
+        opacity: 0;
+        transition: opacity 0.2s;
+    }
+
+    .toy-level.visible {
+        opacity: 1;
+    }
+
     .toy-switch {
         width: 38px;
         height: 22px;
@@ -561,6 +576,7 @@
 
             <div class="toy-sync">
                 <span class="toy-sync-label">Sincronizar juguete</span>
+                <span id="toy-level" class="toy-level"></span>
                 <button id="toy-help" class="toy-help-btn" type="button" title="¿Qué necesito para esto?" aria-label="Ayuda sobre sincronizar juguete">?</button>
                 <button id="toy-switch" class="toy-switch" role="switch" aria-checked="false" title="Sincronizar juguete al ritmo"></button>
                 <div id="toy-note" class="toy-note">Pulsa el interruptor para generar un código QR y sincronizar tu juguete Lovense — nada que instalar.</div>
@@ -586,20 +602,34 @@
         let dataArray = null;
         let listeners = [];
         let rafId = null;
+        let failed = false;
+        let failListener = () => {};
 
         function ensureContext(audioElement) {
-            if (audioCtx) return;
+            if (audioCtx || failed) return;
             const Ctx = window.AudioContext || window.webkitAudioContext;
-            if (!Ctx) return; // navegador sin Web Audio: la interfaz sigue funcionando sin visualizador
-            audioCtx = new Ctx();
-            const source = audioCtx.createMediaElementSource(audioElement);
-            analyser = audioCtx.createAnalyser();
-            analyser.fftSize = 256;
-            analyser.smoothingTimeConstant = 0.75;
-            dataArray = new Uint8Array(analyser.frequencyBinCount);
-            source.connect(analyser);
-            analyser.connect(audioCtx.destination);
-            loop();
+            if (!Ctx) { failed = true; failListener('no-web-audio'); return; }
+
+            try {
+                const ctx = new Ctx();
+                const source = ctx.createMediaElementSource(audioElement);
+                const an = ctx.createAnalyser();
+                an.fftSize = 256;
+                an.smoothingTimeConstant = 0.75;
+                source.connect(an);
+                an.connect(ctx.destination);
+
+                audioCtx = ctx;
+                analyser = an;
+                dataArray = new Uint8Array(analyser.frequencyBinCount);
+                loop();
+            } catch (err) {
+                console.error('AudioEngine: no se pudo montar el analizador de audio:', err);
+                audioCtx = null;
+                analyser = null;
+                failed = true; // no reintentar en bucle; ya avisamos una vez
+                failListener('setup-error', err);
+            }
         }
 
         function resume() {
@@ -618,7 +648,9 @@
             return () => { listeners = listeners.filter(l => l !== fn); };
         }
 
-        return { ensureContext, resume, subscribe };
+        function onFail(fn) { failListener = fn; }
+
+        return { ensureContext, resume, subscribe, onFail };
     })();
 
     // ---------------------------------------------------------------
@@ -642,6 +674,7 @@
         let unsubscribeAudio = null;
         let lastSent = 0;
         let statusListener = () => {};
+        let levelListener = () => {};
 
         async function requestQR() {
             const res = await fetch('/api/lovense/qr', { method: 'POST' });
@@ -696,6 +729,7 @@
             }
             connected = false;
             currentUid = null;
+            levelListener(null);
         }
 
         function feed(dataArray) {
@@ -709,6 +743,7 @@
             const intensity = Math.min(1, (sum / (BASS_BINS * 255)) * 1.3);
             const level = Math.round(intensity * VIBRATE_MAX);
 
+            levelListener(level);
             sendVibrate(currentUid, level).catch(() => { /* comando perdido: no pasa nada, va el siguiente */ });
         }
 
@@ -725,12 +760,14 @@
         }
 
         function setStatusListener(fn) { statusListener = fn; }
+        function setLevelListener(fn) { levelListener = fn; }
 
         return {
             connect,
             disconnect,
             attachToAudio,
             setStatusListener,
+            setLevelListener,
             get connected() { return connected; },
         };
     })();
@@ -762,6 +799,7 @@
     const toySwitch = document.getElementById('toy-switch');
     const toyHelp = document.getElementById('toy-help');
     const toyNote = document.getElementById('toy-note');
+    const toyLevel = document.getElementById('toy-level');
 
     let previousVolume = 1;
     let toySyncEnabled = false;
@@ -1014,6 +1052,15 @@
         if (status === 'connected') {
             showToyNote('¡Conectado! Ya vibra al ritmo de los graves de la sesión.', 6000);
         }
+    });
+
+    ToySync.setLevelListener((level) => {
+        if (level === null) {
+            toyLevel.classList.remove('visible');
+            return;
+        }
+        toyLevel.textContent = `${level}/20`;
+        toyLevel.classList.add('visible');
     });
 
     toySwitch.onclick = async () => {
