@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mi Reproductor de Sesiones</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://api.lovense.com/api/lan/v2/lan.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -563,7 +564,7 @@
                 <span class="toy-sync-label">Sincronizar juguete</span>
                 <button id="toy-help" class="toy-help-btn" type="button" title="¿Qué necesito para esto?" aria-label="Ayuda sobre sincronizar juguete">?</button>
                 <button id="toy-switch" class="toy-switch" role="switch" aria-checked="false" title="Sincronizar juguete al ritmo"></button>
-                <div id="toy-note" class="toy-note">Necesita Intiface Central abierto en este dispositivo, con el servidor iniciado (puerto 12345). Nada de esto pasa por nuestro servidor: la conexión es directa entre esta página y tu Intiface Central.</div>
+                <div id="toy-note" class="toy-note">Pulsa el interruptor para generar un código QR y sincronizar tu juguete Lovense — nada que instalar.</div>
             </div>
         </div>
 
@@ -622,80 +623,77 @@
     })();
 
     // ---------------------------------------------------------------
-    // ToySync: conecta a Intiface Central (https://intiface.com/central)
-    // corriendo en el MISMO dispositivo que el navegador, vía WebSocket
-    // local (ws://127.0.0.1:12345 por defecto). Nada de esto toca el
-    // servidor del reproductor — es una conexión 100% local del usuario
-    // a su propia app. Usa la librería oficial "buttplug" (buttplug.io),
-    // cargada solo si el usuario activa el interruptor.
+    // ToySync: sincroniza un juguete Lovense usando la Standard JS API
+    // de Lovense (lan.js, cargado en el <head>). El navegador habla
+    // DIRECTO con la app Lovense Remote del usuario por HTTPS — nuestro
+    // servidor solo interviene para pedir el código QR (necesita el
+    // token secreto) y para recibir el aviso de "ya escaneado" que la
+    // app de Lovense manda por su cuenta a nuestro Callback URL.
     // ---------------------------------------------------------------
     const ToySync = (() => {
-        const LIBRARY_URL = 'https://cdn.jsdelivr.net/npm/buttplug@5/dist/web/buttplug.js';
-        const SEND_INTERVAL_MS = 100; // máx. ~10 comandos/seg, para no saturar el Bluetooth
+        const SEND_INTERVAL_MS = 300; // ritmo de envío de comandos a Lovense
         const BASS_BINS = 8;          // graves = primeros bins del análisis de frecuencia
+        const VIBRATE_MAX = 20;       // escala de intensidad de Lovense: 0-20
+        const POLL_INTERVAL_MS = 2000;
+        const POLL_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutos para escanear el QR
 
-        let client = null;
-        let devices = [];
+        let connected = false;
+        let pollTimer = null;
         let unsubscribeAudio = null;
         let lastSent = 0;
         let statusListener = () => {};
 
-        function loadLibrary() {
+        async function requestQR() {
+            const res = await fetch('/api/lovense/qr', { method: 'POST' });
+            if (!res.ok) {
+                const msg = await res.text().catch(() => '');
+                throw new Error(msg || 'No se pudo pedir el código QR.');
+            }
+            return res.json(); // { uid, qr }
+        }
+
+        function pollStatus(uid) {
             return new Promise((resolve, reject) => {
-                if (window.Buttplug) return resolve();
-                const script = document.createElement('script');
-                script.src = LIBRARY_URL;
-                script.onload = () => resolve();
-                script.onerror = () => reject(new Error('No se pudo cargar la librería de control (revisa tu conexión).'));
-                document.head.appendChild(script);
+                const start = Date.now();
+                pollTimer = setInterval(async () => {
+                    if (Date.now() - start > POLL_TIMEOUT_MS) {
+                        clearInterval(pollTimer);
+                        reject(new Error('Se agotó el tiempo esperando el escaneo del código QR.'));
+                        return;
+                    }
+                    try {
+                        const res = await fetch(`/api/lovense/status?uid=${encodeURIComponent(uid)}`);
+                        if (res.status === 204) return; // todavía no ha escaneado
+                        if (!res.ok) return;
+                        const data = await res.json();
+                        clearInterval(pollTimer);
+                        resolve(data);
+                    } catch (e) { /* red caída momentáneamente: reintenta en el siguiente tick */ }
+                }, POLL_INTERVAL_MS);
             });
         }
 
-        async function connect(address) {
-            await loadLibrary();
+        async function connect(onQrReady) {
+            const { uid, qr } = await requestQR();
+            if (!qr) throw new Error('Lovense no devolvió un código QR.');
+            onQrReady(qr);
 
-            const connector = new Buttplug.ButtplugBrowserWebsocketClientConnector(address);
-            client = new Buttplug.ButtplugClient('Reproductor de sesiones');
+            const callbackData = await pollStatus(uid);
 
-            client.addListener('disconnect', () => {
-                devices = [];
-                client = null;
-                statusListener('disconnected');
-            });
-            client.addListener('deviceadded', (device) => {
-                devices.push(device);
-                statusListener('device-added', device.name);
-            });
-            client.addListener('deviceremoved', (device) => {
-                devices = devices.filter(d => d !== device);
-                statusListener('device-removed', device.name);
-            });
-
-            await client.connect(connector);
-            await client.startScanning();
+            if (!window.lovense) throw new Error('No se pudo cargar la librería de Lovense (lan.js).');
+            window.lovense.setConnectCallbackData(callbackData);
+            connected = true;
             statusListener('connected');
         }
 
-        async function stopAll() {
-            for (const d of devices) {
-                try { await d.stop(); } catch (e) { /* el juguete ya pudo desconectarse */ }
-            }
-        }
-
-        async function disconnect() {
+        function disconnect() {
             detachFromAudio();
-            if (client) {
-                try {
-                    await stopAll();
-                    await client.disconnect();
-                } catch (e) { /* puede que ya estuviera desconectado */ }
-            }
-            client = null;
-            devices = [];
+            clearInterval(pollTimer);
+            connected = false;
         }
 
         function feed(dataArray) {
-            if (!client || devices.length === 0) return;
+            if (!connected || !window.lovense) return;
             const now = performance.now();
             if (now - lastSent < SEND_INTERVAL_MS) return;
             lastSent = now;
@@ -703,10 +701,16 @@
             let sum = 0;
             for (let i = 0; i < BASS_BINS; i++) sum += dataArray[i];
             const intensity = Math.min(1, (sum / (BASS_BINS * 255)) * 1.3);
+            const level = Math.round(intensity * VIBRATE_MAX);
 
-            devices.forEach(d => {
-                d.vibrate(intensity).catch(() => { /* comando perdido: no pasa nada, va el siguiente */ });
-            });
+            try {
+                window.lovense.sendCommand({
+                    command: 'Function',
+                    action: `Vibrate:${level}`,
+                    timeSec: 1,
+                    apiVer: 1,
+                });
+            } catch (e) { /* comando perdido: no pasa nada, va el siguiente */ }
         }
 
         function attachToAudio() {
@@ -728,7 +732,7 @@
             disconnect,
             attachToAudio,
             setStatusListener,
-            get deviceCount() { return devices.length; },
+            get connected() { return connected; },
         };
     })();
 
@@ -966,15 +970,16 @@
     }
 
     // ---------------------------------------------------------------
-    // Interruptor de "Sincronizar juguete": conecta/desconecta de
-    // verdad contra Intiface Central corriendo en este dispositivo.
+    // Interruptor de "Sincronizar juguete": genera el QR de Lovense,
+    // espera a que lo escanees, y a partir de ahí manda comandos de
+    // vibración directo a tu app (sin pasar por Render en cada golpe).
     // ---------------------------------------------------------------
-    const INTIFACE_ADDRESS = 'ws://127.0.0.1:12345';
-    const INTIFACE_HELP_HTML =
-        'Para que el juguete vibre con la música necesitas <strong>Intiface Central</strong>, una app gratuita (de intiface.com, no nuestra) que hace de puente entre el Bluetooth del juguete y esta página.<br><br>' +
-        '1. <a href="https://intiface.com/central" target="_blank" rel="noopener">Descárgala aquí</a> e instálala en este mismo dispositivo.<br>' +
-        '2. Ábrela y pulsa "Start Server".<br>' +
-        '3. Enciende el juguete y activa el interruptor de al lado.';
+    const LOVENSE_HELP_HTML =
+        'Para sincronizar tu juguete <strong>Lovense</strong> al ritmo de la música:<br><br>' +
+        '1. Pulsa el interruptor de al lado — aparecerá un código QR aquí mismo.<br>' +
+        '2. Escanéalo con la app <strong>Lovense Remote</strong> (la misma que ya usas para el juguete).<br>' +
+        '3. Confirma en la app. En cuanto conecte, empieza a vibrar con los graves de la sesión.<br><br>' +
+        'No hace falta instalar nada más — todo pasa por tu propia cuenta de Lovense.';
 
     let toyNoteMode = null; // 'help' | null — para saber si el panel de ayuda está fijo o es un mensaje de estado
 
@@ -1002,22 +1007,13 @@
             return;
         }
         toyNoteMode = 'help';
-        toyNote.innerHTML = INTIFACE_HELP_HTML;
+        toyNote.innerHTML = LOVENSE_HELP_HTML;
         toyNote.classList.add('visible');
     };
 
-    ToySync.setStatusListener((status, detail) => {
+    ToySync.setStatusListener((status) => {
         if (status === 'connected') {
-            showToyNote('Conectado a Intiface Central. Buscando juguetes por Bluetooth…', 5000);
-        } else if (status === 'device-added') {
-            showToyNote(`Detectado: ${escapeHtml(detail)}. Ya vibra al ritmo de los graves.`, 5000);
-        } else if (status === 'device-removed') {
-            showToyNote(`Se desconectó: ${escapeHtml(detail)}.`, 5000);
-        } else if (status === 'disconnected') {
-            toySyncEnabled = false;
-            toySwitch.classList.remove('on');
-            toySwitch.setAttribute('aria-checked', 'false');
-            showToyNote('Desconectado de Intiface Central.', 4000);
+            showToyNote('¡Conectado! Ya vibra al ritmo de los graves de la sesión.', 6000);
         }
     });
 
@@ -1026,7 +1022,7 @@
 
         if (toySyncEnabled) {
             toySwitch.disabled = true;
-            await ToySync.disconnect();
+            ToySync.disconnect();
             toySyncEnabled = false;
             toySwitch.classList.remove('on');
             toySwitch.setAttribute('aria-checked', 'false');
@@ -1036,25 +1032,22 @@
         }
 
         toySwitch.disabled = true;
-        showToyNote('Conectando con Intiface Central…');
         try {
-            await ToySync.connect(INTIFACE_ADDRESS);
+            await ToySync.connect((qrUrl) => {
+                showToyNote(
+                    `Escanea este código con la app <strong>Lovense Remote</strong>:<br>` +
+                    `<img src="${escapeHtml(qrUrl)}" alt="Código QR de Lovense" style="width:150px;height:150px;margin-top:8px;border-radius:8px;display:block;">`
+                );
+            });
             ToySync.attachToAudio();
             toySyncEnabled = true;
             toySwitch.classList.add('on');
             toySwitch.setAttribute('aria-checked', 'true');
-            showToyNote('Conectado. Buscando juguetes por Bluetooth…', 5000);
+            showToyNote('¡Conectado! Ya vibra al ritmo de los graves de la sesión.', 6000);
         } catch (err) {
             console.error('ToySync:', err);
             const detail = (err && err.message) ? err.message : String(err);
-            const lower = detail.toLowerCase();
-            let hint;
-            if (lower.includes('permission') || lower.includes('not allowed') || lower.includes('notallowed')) {
-                hint = 'Chrome pidió permiso para acceder a tu red local y no lo concediste (o lo bloqueó). Pulsa el candado/ícono junto a la URL → Permisos del sitio → Red local → Permitir, y vuelve a intentar.';
-            } else {
-                hint = `No se encontró Intiface Central. <a href="https://intiface.com/central" target="_blank" rel="noopener">Descárgalo aquí</a> (gratis), ábrelo, pulsa "Start Server" y vuelve a intentar.`;
-            }
-            showToyNote(`${hint}<br><span style="opacity:.65">Detalle técnico: ${escapeHtml(detail)}</span>`);
+            showToyNote(`No se pudo conectar con Lovense.<br><span style="opacity:.65">${escapeHtml(detail)}</span>`);
         } finally {
             toySwitch.disabled = false;
         }
