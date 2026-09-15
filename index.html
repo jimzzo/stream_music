@@ -5,7 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mi Reproductor de Sesiones</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://api.lovense.com/api/lan/v2/lan.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700;800&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -623,21 +622,22 @@
     })();
 
     // ---------------------------------------------------------------
-    // ToySync: sincroniza un juguete Lovense usando la Standard JS API
-    // de Lovense (lan.js, cargado en el <head>). El navegador habla
-    // DIRECTO con la app Lovense Remote del usuario por HTTPS — nuestro
-    // servidor solo interviene para pedir el código QR (necesita el
-    // token secreto) y para recibir el aviso de "ya escaneado" que la
-    // app de Lovense manda por su cuenta a nuestro Callback URL.
+    // ToySync: sincroniza un juguete Lovense usando la "Server API" de
+    // Lovense. Nuestro servidor pide el código QR y recibe el aviso de
+    // "ya escaneado" (necesita el token secreto), y también reenvía cada
+    // comando de vibración — el navegador nunca habla directo con la app
+    // local del móvil, porque esa vía choca con CORS. Todo pasa por
+    // /api/lovense/*, servidor-a-servidor con Lovense.
     // ---------------------------------------------------------------
     const ToySync = (() => {
-        const SEND_INTERVAL_MS = 300; // ritmo de envío de comandos a Lovense
+        const SEND_INTERVAL_MS = 500; // ritmo de envío al servidor (dos saltos de red: Render → Lovense)
         const BASS_BINS = 8;          // graves = primeros bins del análisis de frecuencia
         const VIBRATE_MAX = 20;       // escala de intensidad de Lovense: 0-20
         const POLL_INTERVAL_MS = 2000;
         const POLL_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutos para escanear el QR
 
         let connected = false;
+        let currentUid = null;
         let pollTimer = null;
         let unsubscribeAudio = null;
         let lastSent = 0;
@@ -673,15 +673,17 @@
             });
         }
 
+        function sendVibrate(uid, level) {
+            return fetch(`/api/lovense/vibrate?uid=${encodeURIComponent(uid)}&level=${level}`, { method: 'POST' });
+        }
+
         async function connect(onQrReady) {
             const { uid, qr } = await requestQR();
             if (!qr) throw new Error('Lovense no devolvió un código QR.');
             onQrReady(qr);
 
-            const callbackData = await pollStatus(uid);
-
-            if (!window.lovense) throw new Error('No se pudo cargar la librería de Lovense (lan.js).');
-            window.lovense.setConnectCallbackData(callbackData);
+            await pollStatus(uid); // solo confirma que ya se emparejó; los comandos van por nuestro servidor
+            currentUid = uid;
             connected = true;
             statusListener('connected');
         }
@@ -689,11 +691,15 @@
         function disconnect() {
             detachFromAudio();
             clearInterval(pollTimer);
+            if (connected && currentUid) {
+                sendVibrate(currentUid, 0).catch(() => {}); // para el juguete al desconectar
+            }
             connected = false;
+            currentUid = null;
         }
 
         function feed(dataArray) {
-            if (!connected || !window.lovense) return;
+            if (!connected || !currentUid) return;
             const now = performance.now();
             if (now - lastSent < SEND_INTERVAL_MS) return;
             lastSent = now;
@@ -703,14 +709,7 @@
             const intensity = Math.min(1, (sum / (BASS_BINS * 255)) * 1.3);
             const level = Math.round(intensity * VIBRATE_MAX);
 
-            try {
-                window.lovense.sendCommand({
-                    command: 'Function',
-                    action: `Vibrate:${level}`,
-                    timeSec: 1,
-                    apiVer: 1,
-                });
-            } catch (e) { /* comando perdido: no pasa nada, va el siguiente */ }
+            sendVibrate(currentUid, level).catch(() => { /* comando perdido: no pasa nada, va el siguiente */ });
         }
 
         function attachToAudio() {
