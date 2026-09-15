@@ -436,6 +436,11 @@
         background: #fff;
     }
 
+    .toy-switch:disabled {
+        opacity: 0.55;
+        cursor: wait;
+    }
+
     .toy-note {
         position: absolute;
         bottom: calc(100% + 10px);
@@ -530,7 +535,7 @@
             <div class="toy-sync">
                 <span class="toy-sync-label">Sincronizar juguete</span>
                 <button id="toy-switch" class="toy-switch" role="switch" aria-checked="false" title="Sincronizar juguete al ritmo"></button>
-                <div id="toy-note" class="toy-note">Esta función se conecta en el próximo paso (vía Intiface Central, en tu propio dispositivo). Por ahora solo queda guardada tu preferencia.</div>
+                <div id="toy-note" class="toy-note">Necesita Intiface Central abierto en este dispositivo, con el servidor iniciado (puerto 12345). Nada de esto pasa por nuestro servidor: la conexión es directa entre esta página y tu Intiface Central.</div>
             </div>
         </div>
 
@@ -586,6 +591,117 @@
         }
 
         return { ensureContext, resume, subscribe };
+    })();
+
+    // ---------------------------------------------------------------
+    // ToySync: conecta a Intiface Central (https://intiface.com/central)
+    // corriendo en el MISMO dispositivo que el navegador, vía WebSocket
+    // local (ws://127.0.0.1:12345 por defecto). Nada de esto toca el
+    // servidor del reproductor — es una conexión 100% local del usuario
+    // a su propia app. Usa la librería oficial "buttplug" (buttplug.io),
+    // cargada solo si el usuario activa el interruptor.
+    // ---------------------------------------------------------------
+    const ToySync = (() => {
+        const LIBRARY_URL = 'https://cdn.jsdelivr.net/npm/buttplug@5/dist/web/buttplug.js';
+        const SEND_INTERVAL_MS = 100; // máx. ~10 comandos/seg, para no saturar el Bluetooth
+        const BASS_BINS = 8;          // graves = primeros bins del análisis de frecuencia
+
+        let client = null;
+        let devices = [];
+        let unsubscribeAudio = null;
+        let lastSent = 0;
+        let statusListener = () => {};
+
+        function loadLibrary() {
+            return new Promise((resolve, reject) => {
+                if (window.Buttplug) return resolve();
+                const script = document.createElement('script');
+                script.src = LIBRARY_URL;
+                script.onload = () => resolve();
+                script.onerror = () => reject(new Error('No se pudo cargar la librería de control (revisa tu conexión).'));
+                document.head.appendChild(script);
+            });
+        }
+
+        async function connect(address) {
+            await loadLibrary();
+
+            const connector = new Buttplug.ButtplugBrowserWebsocketClientConnector(address);
+            client = new Buttplug.ButtplugClient('Reproductor de sesiones');
+
+            client.addListener('disconnect', () => {
+                devices = [];
+                client = null;
+                statusListener('disconnected');
+            });
+            client.addListener('deviceadded', (device) => {
+                devices.push(device);
+                statusListener('device-added', device.name);
+            });
+            client.addListener('deviceremoved', (device) => {
+                devices = devices.filter(d => d !== device);
+                statusListener('device-removed', device.name);
+            });
+
+            await client.connect(connector);
+            await client.startScanning();
+            statusListener('connected');
+        }
+
+        async function stopAll() {
+            for (const d of devices) {
+                try { await d.stop(); } catch (e) { /* el juguete ya pudo desconectarse */ }
+            }
+        }
+
+        async function disconnect() {
+            detachFromAudio();
+            if (client) {
+                try {
+                    await stopAll();
+                    await client.disconnect();
+                } catch (e) { /* puede que ya estuviera desconectado */ }
+            }
+            client = null;
+            devices = [];
+        }
+
+        function feed(dataArray) {
+            if (!client || devices.length === 0) return;
+            const now = performance.now();
+            if (now - lastSent < SEND_INTERVAL_MS) return;
+            lastSent = now;
+
+            let sum = 0;
+            for (let i = 0; i < BASS_BINS; i++) sum += dataArray[i];
+            const intensity = Math.min(1, (sum / (BASS_BINS * 255)) * 1.3);
+
+            devices.forEach(d => {
+                d.vibrate(intensity).catch(() => { /* comando perdido: no pasa nada, va el siguiente */ });
+            });
+        }
+
+        function attachToAudio() {
+            if (unsubscribeAudio) return;
+            unsubscribeAudio = AudioEngine.subscribe(feed);
+        }
+
+        function detachFromAudio() {
+            if (unsubscribeAudio) {
+                unsubscribeAudio();
+                unsubscribeAudio = null;
+            }
+        }
+
+        function setStatusListener(fn) { statusListener = fn; }
+
+        return {
+            connect,
+            disconnect,
+            attachToAudio,
+            setStatusListener,
+            get deviceCount() { return devices.length; },
+        };
     })();
 
     let songs = [];
@@ -821,17 +937,64 @@
     }
 
     // ---------------------------------------------------------------
-    // Interruptor de "Sincronizar juguete": por ahora solo guarda la
-    // preferencia y muestra una nota. La conexión real a Intiface
-    // Central se añade en el siguiente paso.
+    // Interruptor de "Sincronizar juguete": conecta/desconecta de
+    // verdad contra Intiface Central corriendo en este dispositivo.
     // ---------------------------------------------------------------
-    toySwitch.onclick = () => {
-        toySyncEnabled = !toySyncEnabled;
-        toySwitch.classList.toggle('on', toySyncEnabled);
-        toySwitch.setAttribute('aria-checked', String(toySyncEnabled));
+    const INTIFACE_ADDRESS = 'ws://127.0.0.1:12345';
+
+    function showToyNote(text, autoHideMs) {
+        toyNote.textContent = text;
         toyNote.classList.add('visible');
-        clearTimeout(toySwitch._hideTimer);
-        toySwitch._hideTimer = setTimeout(() => toyNote.classList.remove('visible'), 4000);
+        clearTimeout(toyNote._hideTimer);
+        if (autoHideMs) {
+            toyNote._hideTimer = setTimeout(() => toyNote.classList.remove('visible'), autoHideMs);
+        }
+    }
+
+    ToySync.setStatusListener((status, detail) => {
+        if (status === 'connected') {
+            showToyNote('Conectado a Intiface Central. Buscando juguetes por Bluetooth…', 5000);
+        } else if (status === 'device-added') {
+            showToyNote(`Detectado: ${detail}. Ya vibra al ritmo de los graves.`, 5000);
+        } else if (status === 'device-removed') {
+            showToyNote(`Se desconectó: ${detail}.`, 5000);
+        } else if (status === 'disconnected') {
+            toySyncEnabled = false;
+            toySwitch.classList.remove('on');
+            toySwitch.setAttribute('aria-checked', 'false');
+            showToyNote('Desconectado de Intiface Central.', 4000);
+        }
+    });
+
+    toySwitch.onclick = async () => {
+        if (toySwitch.disabled) return;
+
+        if (toySyncEnabled) {
+            toySwitch.disabled = true;
+            await ToySync.disconnect();
+            toySyncEnabled = false;
+            toySwitch.classList.remove('on');
+            toySwitch.setAttribute('aria-checked', 'false');
+            toySwitch.disabled = false;
+            showToyNote('Desconectado.', 3000);
+            return;
+        }
+
+        toySwitch.disabled = true;
+        showToyNote('Conectando con Intiface Central…');
+        try {
+            await ToySync.connect(INTIFACE_ADDRESS);
+            ToySync.attachToAudio();
+            toySyncEnabled = true;
+            toySwitch.classList.add('on');
+            toySwitch.setAttribute('aria-checked', 'true');
+            showToyNote('Conectado. Buscando juguetes por Bluetooth…', 5000);
+        } catch (err) {
+            console.error('ToySync:', err);
+            showToyNote('No se encontró Intiface Central. Ábrelo en este dispositivo, pulsa "Start Server" y vuelve a intentar.');
+        } finally {
+            toySwitch.disabled = false;
+        }
     };
 
     // ---------------------------------------------------------------
