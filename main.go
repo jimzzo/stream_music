@@ -45,7 +45,7 @@ type ManifestEntry struct {
 
 const (
 	// Rango leído para MP3/FLAC (el tag/los bloques de metadatos van al principio)
-	headFetchSize int64 = 3 * 1024 * 1024 // 2MB
+	headFetchSize int64 = 3 * 1024 * 1024 // 3MB
 	// Rango leído para WAV (Serato/rekordbox/Traktor/Mp3tag suelen meter el
 	// chunk id3 DESPUÉS del audio, casi al final del archivo). Título, artista
 	// y carátula se extraen SIEMPRE del mismo buffer/rango para evitar que uno
@@ -60,7 +60,7 @@ const (
 	// Sube este número cada vez que cambies la lógica de extractMetadata para
 	// forzar un reprocesado automático de toda la librería en el siguiente
 	// despliegue, sin tener que tocar nada a mano en R2.
-	metadataVersion = 2
+	metadataVersion = 3
 )
 
 var (
