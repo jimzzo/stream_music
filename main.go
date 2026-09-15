@@ -803,6 +803,43 @@ func lovenseStatus(w http.ResponseWriter, r *http.Request) {
 	w.Write(sess.data)
 }
 
+// lovenseVibrate reenvía un comando de vibración a través del "Server API"
+// de Lovense (servidor-a-servidor), en vez de que el navegador intente
+// hablar directo con la app local — esa vía directa choca con CORS porque
+// el servidor local de Lovense Remote no añade la cabecera de permiso que
+// los navegadores exigen. Aquí no hay restricción de navegador de por
+// medio: es una llamada HTTPS normal de nuestro Go hacia Lovense.
+func lovenseVibrate(w http.ResponseWriter, r *http.Request) {
+	if lovenseDevToken == "" {
+		http.Error(w, "Lovense no configurado en el servidor", http.StatusInternalServerError)
+		return
+	}
+	uid := r.URL.Query().Get("uid")
+	level := r.URL.Query().Get("level")
+	if uid == "" || level == "" {
+		http.Error(w, "faltan parámetros (uid, level)", http.StatusBadRequest)
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]interface{}{
+		"token":   lovenseDevToken,
+		"uid":     uid,
+		"command": "Function",
+		"action":  "Vibrate:" + level,
+		"timeSec": 1,
+		"apiVer":  1,
+	})
+
+	resp, err := http.Post("https://api.lovense.com/api/lan/v2/command", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		http.Error(w, "No se pudo contactar con Lovense: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Content-Type", "application/json")
+	io.Copy(w, resp.Body)
+}
+
 func main() {
 	initS3()
 	initLovense()
@@ -826,6 +863,7 @@ func main() {
 	http.HandleFunc("/api/lovense/qr", enableCORS(lovenseGetQR))
 	http.HandleFunc("/api/lovense/callback", enableCORS(lovenseCallback))
 	http.HandleFunc("/api/lovense/status", enableCORS(lovenseStatus))
+	http.HandleFunc("/api/lovense/vibrate", enableCORS(lovenseVibrate))
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
 	port := os.Getenv("PORT")
