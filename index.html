@@ -1165,6 +1165,13 @@
         songTitleEl.innerText = song.titulo;
         songArtistEl.innerText = song.artista;
 
+        // Sin esto, si vienes de un directo (o de otra canción a medias),
+        // la barra se queda mostrando el progreso de lo anterior hasta que
+        // arranca la reproducción de verdad y llega el primer "timeupdate".
+        progressBar.style.width = '0%';
+        currentTimeEl.innerText = '0:00';
+        durationEl.innerText = '0:00';
+
         if (song.titulo.length > 28) {
             songTitleEl.classList.add('marquee');
         } else {
@@ -1216,6 +1223,7 @@
     prevBtn.onclick = () => { if (songs.length > 0) playSong((currentIndex - 1 + songs.length) % songs.length); };
 
     audioElement.ontimeupdate = () => {
+        if (isLiveMode) return; // un directo no tiene una duración con sentido que mostrar
         if (!isDragging && audioElement.duration) {
             const percent = (audioElement.currentTime / audioElement.duration) * 100;
             progressBar.style.width = `${percent}%`;
