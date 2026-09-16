@@ -1318,7 +1318,11 @@ func liveStatus(w http.ResponseWriter, r *http.Request) {
 			// conectada pero posiblemente en espera, 2 = "on air" (en vivo de
 			// verdad). Lo dejamos visible en "debug" para poder ajustar el
 			// umbral con datos reales de tu proveedor si hiciera falta.
-			live = stats.StreamStatus >= 2
+			// Algunos proveedores solo usan 0 (nadie conectado) y 1 (fuente
+			// en vivo conectada), sin el estado intermedio "2 = on air" que
+			// documentan otras versiones — con datos reales de tu servidor,
+			// >0 ya identifica bien cuándo estás emitiendo de verdad.
+			live = stats.StreamStatus > 0
 			debug = fmt.Sprintf("streamstatus=%d currentlisteners=%d songtitle=%q", stats.StreamStatus, stats.CurrentListeners, stats.SongTitle)
 		} else {
 			conn, _, _, cerr := dialLiveStream()
