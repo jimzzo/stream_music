@@ -311,6 +311,30 @@
 
     /* ---------- Art + visualizer ring ---------- */
 
+    .toast {
+        position: absolute;
+        top: -6px;
+        left: 50%;
+        transform: translate(-50%, -12px);
+        z-index: 5;
+        background: var(--surface-strong);
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        padding: 9px 20px;
+        font-size: 0.82rem;
+        color: var(--text);
+        white-space: nowrap;
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.5);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s ease, transform 0.3s ease;
+    }
+
+    .toast.visible {
+        opacity: 1;
+        transform: translate(-50%, 0);
+    }
+
     .art-stage {
         position: relative;
         width: 320px;
@@ -763,6 +787,8 @@
 
     <div class="stage">
 
+        <div id="toast" class="toast"></div>
+
         <div class="art-stage">
             <canvas id="ring-canvas" width="320" height="320"></canvas>
             <div id="art-container" class="album-art-container">
@@ -1065,6 +1091,7 @@
     const toyHelp = document.getElementById('toy-help');
     const toyNote = document.getElementById('toy-note');
     const toyLevel = document.getElementById('toy-level');
+    const toast = document.getElementById('toast');
     const liveToggle = document.getElementById('live-toggle');
     const liveLabel = document.getElementById('live-label');
     const liveSettingsBtn = document.getElementById('live-settings-btn');
@@ -1265,12 +1292,19 @@
     let isLiveMode = false;
     let liveAvailable = false;
 
+    function showToast(text, duration = 4000) {
+        toast.textContent = text;
+        toast.classList.add('visible');
+        clearTimeout(toast._hideTimer);
+        toast._hideTimer = setTimeout(() => toast.classList.remove('visible'), duration);
+    }
+
     audioElement.onended = () => {
         if (isLiveMode) {
             // un directo no debería "terminar" solo, pero si el navegador lo
             // interpreta así (conexión cortada), lo tratamos como tal.
             exitLiveMode();
-            songTitleEl.innerText = 'La transmisión terminó';
+            showToast('La transmisión terminó');
             return;
         }
         nextBtn.click();
@@ -1293,7 +1327,7 @@
         );
         if (isLiveMode) {
             exitLiveMode();
-            songTitleEl.innerText = 'Se perdió la conexión con el directo';
+            showToast('Se perdió la conexión con el directo');
         }
     });
 
@@ -1326,6 +1360,7 @@
         artPlaceholder.className = 'fa-solid fa-compact-disc album-art-placeholder';
         audioElement.pause();
         audioElement.removeAttribute('src');
+        playIcon.className = 'fa-solid fa-play'; // lo pausamos nosotros, no el usuario: refleja el estado real
         if (songs.length > 0) prepareSong(currentIndex);
     }
 
@@ -1346,7 +1381,7 @@
         liveToggle.classList.toggle('available', liveAvailable);
         if (!liveAvailable && isLiveMode) {
             exitLiveMode();
-            songTitleEl.innerText = 'La transmisión en directo terminó';
+            showToast('La transmisión en directo terminó');
         }
     }
 
