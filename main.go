@@ -14,8 +14,10 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1041,44 +1043,108 @@ func setLiveConfig(w http.ResponseWriter, r *http.Request) {
 // para leer los bytes de audio puros. Se usa net.Dial en vez del cliente
 // HTTP normal de Go porque muchos Shoutcast responden "ICY 200 OK" en vez
 // de "HTTP/1.0 200 OK", y el parser HTTP estándar de Go rechaza eso.
+// dialLiveStreamOnce abre una conexión, manda la petición y lee la línea de
+// estado + cabeceras, sin decidir todavía qué hacer con el resultado —
+// eso lo decide dialLiveStream, que es quien sabe seguir redirecciones.
+func dialLiveStreamOnce(host, path string) (conn net.Conn, reader *bufio.Reader, statusCode int, location string, err error) {
+	conn, err = net.DialTimeout("tcp", host, 8*time.Second)
+	if err != nil {
+		return nil, nil, 0, "", err
+	}
+
+	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nIcy-MetaData: 0\r\nConnection: close\r\n\r\n", path, host)
+	if _, err = conn.Write([]byte(req)); err != nil {
+		conn.Close()
+		return nil, nil, 0, "", err
+	}
+
+	reader = bufio.NewReader(conn)
+
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, nil, 0, "", err
+	}
+	for _, field := range strings.Fields(statusLine) {
+		if n, cerr := strconv.Atoi(field); cerr == nil && n >= 100 && n < 600 {
+			statusCode = n
+			break
+		}
+	}
+
+	for {
+		line, lerr := reader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || lerr != nil {
+			break
+		}
+		if loc, ok := strings.CutPrefix(strings.ToLower(trimmed), "location:"); ok {
+			// recorta usando la posición real para conservar mayúsculas/minúsculas del valor
+			location = strings.TrimSpace(trimmed[len(trimmed)-len(loc):])
+		}
+	}
+
+	return conn, reader, statusCode, location, nil
+}
+
+// parseRedirectLocation interpreta la cabecera Location, que puede venir
+// como URL completa (http://host:puerto/ruta) o como ruta relativa
+// (;stream.mp3), y devuelve a qué host/ruta hay que reconectar.
+func parseRedirectLocation(location, currentHost string) (host, path string, err error) {
+	if strings.HasPrefix(location, "http://") || strings.HasPrefix(location, "https://") {
+		u, perr := url.Parse(location)
+		if perr != nil {
+			return "", "", perr
+		}
+		p := u.Path
+		if u.RawQuery != "" {
+			p += "?" + u.RawQuery
+		}
+		if p == "" {
+			p = "/"
+		}
+		return u.Host, p, nil
+	}
+	if !strings.HasPrefix(location, "/") {
+		location = "/" + location
+	}
+	return currentHost, location, nil
+}
+
+// dialLiveStream abre la conexión al Shoutcast/Icecast, siguiendo
+// redirecciones (302, típico en Shoutcast para mandarte del host base al
+// punto de montaje real) hasta llegar a una respuesta 200 con el audio.
+// Usa net.Dial en vez del cliente HTTP normal de Go porque muchos
+// Shoutcast responden "ICY 200 OK" en vez de "HTTP/1.0 200 OK", y el
+// parser HTTP estándar de Go rechaza eso.
 func dialLiveStream() (net.Conn, *bufio.Reader, error) {
 	host, path, ok := liveStreamTarget()
 	if !ok {
 		return nil, nil, fmt.Errorf("streaming en directo no configurado")
 	}
 
-	conn, err := net.DialTimeout("tcp", host, 8*time.Second)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nIcy-MetaData: 0\r\nConnection: close\r\n\r\n", path, host)
-	if _, err := conn.Write([]byte(req)); err != nil {
-		conn.Close()
-		return nil, nil, err
-	}
-
-	reader := bufio.NewReader(conn)
-
-	statusLine, err := reader.ReadString('\n')
-	if err != nil {
-		conn.Close()
-		return nil, nil, err
-	}
-	if !strings.Contains(statusLine, "200") {
-		conn.Close()
-		return nil, nil, fmt.Errorf("el servidor de streaming respondió: %s", strings.TrimSpace(statusLine))
-	}
-
-	// Cabeceras (formato ICY o HTTP, da igual): las descartamos hasta la línea en blanco.
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil || strings.TrimSpace(line) == "" {
-			break
+	for redirects := 0; redirects < 5; redirects++ {
+		conn, reader, status, location, err := dialLiveStreamOnce(host, path)
+		if err != nil {
+			return nil, nil, err
 		}
+		if status == 200 {
+			return conn, reader, nil
+		}
+		conn.Close()
+
+		if status >= 300 && status < 400 && location != "" {
+			newHost, newPath, perr := parseRedirectLocation(location, host)
+			if perr != nil {
+				return nil, nil, fmt.Errorf("redirección no válida (%s): %w", location, perr)
+			}
+			host, path = newHost, newPath
+			continue
+		}
+		return nil, nil, fmt.Errorf("el servidor de streaming respondió con código %d", status)
 	}
 
-	return conn, reader, nil
+	return nil, nil, fmt.Errorf("demasiadas redirecciones al conectar con el streaming")
 }
 
 // liveProxy retransmite el audio en directo al navegador que lo pida.
