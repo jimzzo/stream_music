@@ -1315,6 +1315,7 @@
         audioElement.play().then(() => {
             playIcon.className = 'fa-solid fa-pause';
         }).catch(err => console.error('Error al reproducir el directo:', err));
+        pollLiveStatus(); // no esperar hasta 20s para mostrar el título real
     }
 
     function exitLiveMode() {
@@ -1334,6 +1335,11 @@
             const data = await res.json();
             liveAvailable = !!data.live;
             if (data.debug) console.log('live status debug:', data.debug);
+            if (isLiveMode) {
+                songArtistEl.innerText = (data.songtitle && data.songtitle.trim())
+                    ? data.songtitle
+                    : 'Sonando ahora mismo';
+            }
         } catch (e) {
             liveAvailable = false;
         }
