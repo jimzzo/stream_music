@@ -1046,16 +1046,16 @@ func setLiveConfig(w http.ResponseWriter, r *http.Request) {
 // dialLiveStreamOnce abre una conexión, manda la petición y lee la línea de
 // estado + cabeceras, sin decidir todavía qué hacer con el resultado —
 // eso lo decide dialLiveStream, que es quien sabe seguir redirecciones.
-func dialLiveStreamOnce(host, path string) (conn net.Conn, reader *bufio.Reader, statusCode int, location string, err error) {
+func dialLiveStreamOnce(host, path string) (conn net.Conn, reader *bufio.Reader, statusCode int, location string, metaInt int, err error) {
 	conn, err = net.DialTimeout("tcp", host, 8*time.Second)
 	if err != nil {
-		return nil, nil, 0, "", err
+		return nil, nil, 0, "", 0, err
 	}
 
 	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nIcy-MetaData: 0\r\nConnection: close\r\n\r\n", path, host)
 	if _, err = conn.Write([]byte(req)); err != nil {
 		conn.Close()
-		return nil, nil, 0, "", err
+		return nil, nil, 0, "", 0, err
 	}
 
 	reader = bufio.NewReader(conn)
@@ -1063,7 +1063,7 @@ func dialLiveStreamOnce(host, path string) (conn net.Conn, reader *bufio.Reader,
 	statusLine, err := reader.ReadString('\n')
 	if err != nil {
 		conn.Close()
-		return nil, nil, 0, "", err
+		return nil, nil, 0, "", 0, err
 	}
 	for _, field := range strings.Fields(statusLine) {
 		if n, cerr := strconv.Atoi(field); cerr == nil && n >= 100 && n < 600 {
@@ -1078,13 +1078,20 @@ func dialLiveStreamOnce(host, path string) (conn net.Conn, reader *bufio.Reader,
 		if trimmed == "" || lerr != nil {
 			break
 		}
-		if loc, ok := strings.CutPrefix(strings.ToLower(trimmed), "location:"); ok {
+		lower := strings.ToLower(trimmed)
+		if loc, ok := strings.CutPrefix(lower, "location:"); ok {
 			// recorta usando la posición real para conservar mayúsculas/minúsculas del valor
 			location = strings.TrimSpace(trimmed[len(trimmed)-len(loc):])
 		}
+		if _, ok := strings.CutPrefix(lower, "icy-metaint:"); ok {
+			valStr := strings.TrimSpace(trimmed[len("icy-metaint:"):])
+			if n, cerr := strconv.Atoi(valStr); cerr == nil && n > 0 {
+				metaInt = n
+			}
+		}
 	}
 
-	return conn, reader, statusCode, location, nil
+	return conn, reader, statusCode, location, metaInt, nil
 }
 
 // parseRedirectLocation interpreta la cabecera Location, que puede venir
@@ -1116,40 +1123,44 @@ func parseRedirectLocation(location, currentHost string) (host, path string, err
 // punto de montaje real) hasta llegar a una respuesta 200 con el audio.
 // Usa net.Dial en vez del cliente HTTP normal de Go porque muchos
 // Shoutcast responden "ICY 200 OK" en vez de "HTTP/1.0 200 OK", y el
-// parser HTTP estándar de Go rechaza eso.
-func dialLiveStream() (net.Conn, *bufio.Reader, error) {
+// parser HTTP estándar de Go rechaza eso. Devuelve también metaInt: si es
+// mayor que 0, el servidor va a mandar metadatos (título de la canción)
+// intercalados dentro del propio audio cada metaInt bytes, y hay que
+// quitarlos antes de mandar el stream al navegador o el audio sale
+// corrupto.
+func dialLiveStream() (conn net.Conn, reader *bufio.Reader, metaInt int, err error) {
 	host, path, ok := liveStreamTarget()
 	if !ok {
-		return nil, nil, fmt.Errorf("streaming en directo no configurado")
+		return nil, nil, 0, fmt.Errorf("streaming en directo no configurado")
 	}
 
 	for redirects := 0; redirects < 5; redirects++ {
-		conn, reader, status, location, err := dialLiveStreamOnce(host, path)
-		if err != nil {
-			return nil, nil, err
+		c, rd, status, location, mi, derr := dialLiveStreamOnce(host, path)
+		if derr != nil {
+			return nil, nil, 0, derr
 		}
 		if status == 200 {
-			return conn, reader, nil
+			return c, rd, mi, nil
 		}
-		conn.Close()
+		c.Close()
 
 		if status >= 300 && status < 400 && location != "" {
 			newHost, newPath, perr := parseRedirectLocation(location, host)
 			if perr != nil {
-				return nil, nil, fmt.Errorf("redirección no válida (%s): %w", location, perr)
+				return nil, nil, 0, fmt.Errorf("redirección no válida (%s): %w", location, perr)
 			}
 			host, path = newHost, newPath
 			continue
 		}
-		return nil, nil, fmt.Errorf("el servidor de streaming respondió con código %d", status)
+		return nil, nil, 0, fmt.Errorf("el servidor de streaming respondió con código %d", status)
 	}
 
-	return nil, nil, fmt.Errorf("demasiadas redirecciones al conectar con el streaming")
+	return nil, nil, 0, fmt.Errorf("demasiadas redirecciones al conectar con el streaming")
 }
 
 // liveProxy retransmite el audio en directo al navegador que lo pida.
 func liveProxy(w http.ResponseWriter, r *http.Request) {
-	conn, reader, err := dialLiveStream()
+	conn, reader, metaInt, err := dialLiveStream()
 	if err != nil {
 		http.Error(w, "No se pudo conectar con el streaming en directo: "+err.Error(), http.StatusBadGateway)
 		return
@@ -1162,39 +1173,165 @@ func liveProxy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 
 	flusher, canFlush := w.(http.Flusher)
+	var flush func()
+	if canFlush {
+		flush = flusher.Flush
+	}
 
+	copyAudioStrippingMeta(w, reader, metaInt, flush)
+}
+
+// copyAudioStrippingMeta copia el audio del origen al navegador. Si
+// metaInt > 0, el servidor intercala cada metaInt bytes un bloque de
+// metadatos (título de la canción) que NO es audio — sin quitarlo, esos
+// bytes corrompen el MP3 que recibe el navegador y el audio falla al
+// decodificar. Se filtra igual tanto si pedimos "Icy-MetaData: 0" como si
+// el servidor lo manda de todas formas.
+func copyAudioStrippingMeta(w io.Writer, reader *bufio.Reader, metaInt int, flush func()) {
 	buf := make([]byte, 8192)
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return // el oyente cerró la conexión (cambió de canción, cerró la pestaña...)
+
+	if metaInt <= 0 {
+		for {
+			n, err := reader.Read(buf)
+			if n > 0 {
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					return // el oyente cerró la conexión
+				}
+				if flush != nil {
+					flush()
+				}
 			}
-			if canFlush {
-				flusher.Flush()
+			if err != nil {
+				return // el servidor de streaming cortó la conexión
 			}
 		}
+	}
+
+	remaining := metaInt
+	for {
+		if remaining == 0 {
+			lenByte, err := reader.ReadByte()
+			if err != nil {
+				return
+			}
+			if metaLen := int(lenByte) * 16; metaLen > 0 {
+				if _, err := io.CopyN(io.Discard, reader, int64(metaLen)); err != nil {
+					return
+				}
+			}
+			remaining = metaInt
+			continue
+		}
+
+		toRead := remaining
+		if toRead > len(buf) {
+			toRead = len(buf)
+		}
+		n, err := reader.Read(buf[:toRead])
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // el oyente cerró la conexión
+			}
+			if flush != nil {
+				flush()
+			}
+			remaining -= n
+		}
 		if err != nil {
-			return // el servidor de streaming cortó la conexión (dejaste de emitir)
+			return // el servidor de streaming cortó la conexión
 		}
 	}
 }
 
-// liveStatus hace una comprobación rápida (sin descargar audio) de si hay
-// alguien emitiendo ahora mismo, para que la interfaz pueda mostrar el
-// indicador de "en directo" sin tener que intentar reproducir a ciegas.
-func liveStatus(w http.ResponseWriter, r *http.Request) {
-	_, _, ok := liveStreamTarget()
-	live := false
-	if ok {
-		conn, _, err := dialLiveStream()
-		if err == nil {
-			live = true
-			conn.Close()
+// shoutcastStats son los campos que nos interesan de la página pública de
+// estadísticas de Shoutcast v2 (/stats?sid=1&json=1, mismo host y puerto
+// que el propio stream). streamstatus es la clave: distingue "el servidor
+// está encendido pero sin nadie emitiendo en vivo" (habitualmente
+// reproduciendo el AutoDJ de relleno) de "hay una fuente en vivo
+// conectada de verdad" — que es justo lo que necesitamos, porque el
+// AutoDJ hace que el simple "¿me llega audio?" no sirva para saber si
+// Virtual DJ está conectado o no.
+type shoutcastStats struct {
+	StreamStatus     int    `json:"streamstatus"`
+	CurrentListeners int    `json:"currentlisteners"`
+	SongTitle        string `json:"songtitle"`
+}
+
+func fetchShoutcastStats(host string) (*shoutcastStats, error) {
+	conn, err := net.DialTimeout("tcp", host, 6*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	req := fmt.Sprintf("GET /stats?sid=1&json=1 HTTP/1.0\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n", host)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil, err
+	}
+
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	statusCode := 0
+	for _, f := range strings.Fields(statusLine) {
+		if n, cerr := strconv.Atoi(f); cerr == nil && n >= 100 && n < 600 {
+			statusCode = n
+			break
 		}
 	}
+	if statusCode != 200 {
+		return nil, fmt.Errorf("la página de estadísticas respondió con código %d", statusCode)
+	}
+
+	for {
+		line, lerr := reader.ReadString('\n')
+		if lerr != nil || strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	body, _ := io.ReadAll(reader)
+	var stats shoutcastStats
+	if jerr := json.Unmarshal(body, &stats); jerr != nil {
+		return nil, fmt.Errorf("no se pudo interpretar las estadísticas (%v); respuesta cruda: %s", jerr, string(body))
+	}
+	return &stats, nil
+}
+
+// liveStatus comprueba si hay alguien emitiendo EN VIVO ahora mismo (no
+// solo si el servidor responde con audio, que sería cierto también con
+// el AutoDJ de relleno puesto). Se apoya en la página de estadísticas de
+// Shoutcast; si esa página no está disponible, recurre al chequeo simple
+// de "¿puedo conectarme?" como respaldo, aunque ese no distinga del
+// AutoDJ.
+func liveStatus(w http.ResponseWriter, r *http.Request) {
+	host, _, ok := liveStreamTarget()
+	live := false
+	debug := ""
+
+	if ok {
+		stats, err := fetchShoutcastStats(host)
+		if err == nil {
+			// Según la documentación de Shoutcast v2: 0 = sin fuente, 1 = fuente
+			// conectada pero posiblemente en espera, 2 = "on air" (en vivo de
+			// verdad). Lo dejamos visible en "debug" para poder ajustar el
+			// umbral con datos reales de tu proveedor si hiciera falta.
+			live = stats.StreamStatus >= 2
+			debug = fmt.Sprintf("streamstatus=%d currentlisteners=%d songtitle=%q", stats.StreamStatus, stats.CurrentListeners, stats.SongTitle)
+		} else {
+			conn, _, _, cerr := dialLiveStream()
+			if cerr == nil {
+				live = true
+				conn.Close()
+			}
+			debug = "sin página de estadísticas (" + err.Error() + "); usando el chequeo simple de conexión"
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]bool{"live": live})
+	json.NewEncoder(w).Encode(map[string]interface{}{"live": live, "debug": debug})
 }
 
 func main() {
