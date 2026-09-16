@@ -1161,12 +1161,10 @@
 
         const cx = w / 2, cy = h / 2;
         const baseRadius = 124; // justo fuera del borde de la carátula (radio 115) con margen
-        const barCount = 64;
-        const step = Math.floor(dataArray.length / barCount) || 1;
+        const halfCount = 32;   // barras por lado — el total sale simétrico (64 en total)
+        const step = Math.floor(dataArray.length / halfCount) || 1;
 
-        for (let i = 0; i < barCount; i++) {
-            const value = dataArray[i * step] / 255;
-            const angle = (i / barCount) * Math.PI * 2 - Math.PI / 2;
+        function drawBar(angle, value) {
             const barLength = 4 + value * 26; // alcance máximo 150, por debajo del borde del lienzo (160)
             const x1 = cx + Math.cos(angle) * baseRadius;
             const y1 = cy + Math.sin(angle) * baseRadius;
@@ -1182,6 +1180,16 @@
             ringCtx.moveTo(x1, y1);
             ringCtx.lineTo(x2, y2);
             ringCtx.stroke();
+        }
+
+        // Graves arriba (ángulo 0), agudos abajo (ángulo PI), repartidos por
+        // igual hacia la derecha y hacia la izquierda — así ningún lado
+        // "arranca" antes que el otro y el anillo queda simétrico.
+        for (let i = 0; i < halfCount; i++) {
+            const value = dataArray[i * step] / 255;
+            const offset = (i / halfCount) * Math.PI;
+            drawBar(-Math.PI / 2 + offset, value); // lado derecho
+            drawBar(-Math.PI / 2 - offset, value); // lado izquierdo (espejo)
         }
 
         // Brillo suave en la carátula acorde a la energía de graves
