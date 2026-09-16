@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -119,6 +122,34 @@ func enableCORS(next http.HandlerFunc) http.HandlerFunc {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+		next(w, r)
+	}
+}
+
+// requireLiveAdmin protege una ruta con usuario/contraseña (HTTP Basic
+// Auth) — el navegador muestra su propio cuadro de acceso nativo, sin que
+// tengamos que montar sesiones ni base de datos de usuarios. Las
+// credenciales salen de las variables de entorno LIVE_ADMIN_USER y
+// LIVE_ADMIN_PASSWORD; si no están puestas, la ruta queda bloqueada del
+// todo (más seguro por defecto que dejarla abierta por descuido).
+func requireLiveAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		wantUser := os.Getenv("LIVE_ADMIN_USER")
+		wantPass := os.Getenv("LIVE_ADMIN_PASSWORD")
+		if wantUser == "" || wantPass == "" {
+			http.Error(w, "Protección por contraseña no configurada en el servidor (faltan LIVE_ADMIN_USER / LIVE_ADMIN_PASSWORD)", http.StatusServiceUnavailable)
+			return
+		}
+
+		gotUser, gotPass, ok := r.BasicAuth()
+		userOK := subtle.ConstantTimeCompare([]byte(gotUser), []byte(wantUser)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(gotPass), []byte(wantPass)) == 1
+		if !ok || !userOK || !passOK {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Configuracion del streaming"`)
+			http.Error(w, "No autorizado", http.StatusUnauthorized)
+			return
+		}
+
 		next(w, r)
 	}
 }
@@ -873,9 +904,237 @@ func lovenseVibrate(w http.ResponseWriter, r *http.Request) {
 	w.Write(respBody)
 }
 
+// ---------------------------------------------------------------------
+// Streaming en directo (Shoutcast/Icecast externo, ej. Virtual DJ). El
+// navegador nunca toca el servidor de streaming directamente: todo pasa
+// por aquí, así el audio sigue siendo del mismo origen que el resto de
+// la web (el visualizador y la sincronización de juguete siguen
+// funcionando automáticamente, sin CORS de por medio).
+//
+// El host/puerto/ruta se pueden configurar desde la propia web (se
+// guardan en R2, en _manifest/live-config.json) para poder cambiar de
+// proveedor de streaming sin tocar el código ni Render. Las variables de
+// entorno LIVE_STREAM_HOST / LIVE_STREAM_PATH solo sirven como valor
+// inicial la primera vez, si todavía no hay nada guardado en R2.
+// ---------------------------------------------------------------------
+
+const liveConfigKey = "_manifest/live-config.json"
+
+type LiveConfig struct {
+	Host string `json:"host"`
+	Path string `json:"path"`
+}
+
+var (
+	liveConfigMutex sync.Mutex
+	liveConfig      LiveConfig
+)
+
+func initLiveConfig() {
+	liveConfigMutex.Lock()
+	defer liveConfigMutex.Unlock()
+
+	// Valor inicial desde variables de entorno, por si es la primera vez
+	// que arranca y todavía no hay nada guardado en R2.
+	liveConfig = LiveConfig{
+		Host: os.Getenv("LIVE_STREAM_HOST"),
+		Path: os.Getenv("LIVE_STREAM_PATH"),
+	}
+	if liveConfig.Path == "" {
+		liveConfig.Path = "/"
+	}
+
+	if s3Client == nil {
+		return
+	}
+	res, err := s3Client.GetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(liveConfigKey),
+	})
+	if err != nil {
+		return // no existe todavía en R2: nos quedamos con lo de las variables de entorno
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return
+	}
+	var saved LiveConfig
+	if err := json.Unmarshal(data, &saved); err == nil && saved.Host != "" {
+		liveConfig = saved
+	}
+}
+
+func liveStreamTarget() (host, path string, ok bool) {
+	liveConfigMutex.Lock()
+	defer liveConfigMutex.Unlock()
+	if liveConfig.Host == "" {
+		return "", "", false
+	}
+	path = liveConfig.Path
+	if path == "" {
+		path = "/"
+	}
+	return liveConfig.Host, path, true
+}
+
+// getLiveConfig devuelve el host/ruta configurados ahora mismo, para que
+// la página pueda rellenar el formulario con lo que ya hay guardado.
+func getLiveConfig(w http.ResponseWriter, r *http.Request) {
+	liveConfigMutex.Lock()
+	cfg := liveConfig
+	liveConfigMutex.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(cfg)
+}
+
+// setLiveConfig guarda el nuevo host/ruta, tanto en memoria (efecto
+// inmediato) como en R2 (para que sobreviva a un reinicio).
+func setLiveConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "método no permitido", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var cfg LiveConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		http.Error(w, "JSON inválido", http.StatusBadRequest)
+		return
+	}
+	cfg.Host = strings.TrimSpace(cfg.Host)
+	cfg.Path = strings.TrimSpace(cfg.Path)
+	if cfg.Host == "" {
+		http.Error(w, "falta el host del servidor de streaming", http.StatusBadRequest)
+		return
+	}
+	if cfg.Path == "" {
+		cfg.Path = "/"
+	}
+	if !strings.HasPrefix(cfg.Path, "/") {
+		cfg.Path = "/" + cfg.Path
+	}
+
+	liveConfigMutex.Lock()
+	liveConfig = cfg
+	liveConfigMutex.Unlock()
+
+	if s3Client != nil {
+		data, _ := json.Marshal(cfg)
+		if _, err := s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
+			Bucket:      aws.String(bucketName),
+			Key:         aws.String(liveConfigKey),
+			Body:        bytes.NewReader(data),
+			ContentType: aws.String("application/json"),
+		}); err != nil {
+			log.Println("Aviso: no se pudo guardar la configuración de streaming en R2:", err)
+			// seguimos igualmente: el cambio ya está activo en memoria para esta sesión del servidor
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"ok": true})
+}
+
+// dialLiveStream abre la conexión al Shoutcast/Icecast y deja el lector ya
+// posicionado justo después de la línea de estado y las cabeceras, listo
+// para leer los bytes de audio puros. Se usa net.Dial en vez del cliente
+// HTTP normal de Go porque muchos Shoutcast responden "ICY 200 OK" en vez
+// de "HTTP/1.0 200 OK", y el parser HTTP estándar de Go rechaza eso.
+func dialLiveStream() (net.Conn, *bufio.Reader, error) {
+	host, path, ok := liveStreamTarget()
+	if !ok {
+		return nil, nil, fmt.Errorf("streaming en directo no configurado")
+	}
+
+	conn, err := net.DialTimeout("tcp", host, 8*time.Second)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nIcy-MetaData: 0\r\nConnection: close\r\n\r\n", path, host)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+
+	reader := bufio.NewReader(conn)
+
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return nil, nil, err
+	}
+	if !strings.Contains(statusLine, "200") {
+		conn.Close()
+		return nil, nil, fmt.Errorf("el servidor de streaming respondió: %s", strings.TrimSpace(statusLine))
+	}
+
+	// Cabeceras (formato ICY o HTTP, da igual): las descartamos hasta la línea en blanco.
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	return conn, reader, nil
+}
+
+// liveProxy retransmite el audio en directo al navegador que lo pida.
+func liveProxy(w http.ResponseWriter, r *http.Request) {
+	conn, reader, err := dialLiveStream()
+	if err != nil {
+		http.Error(w, "No se pudo conectar con el streaming en directo: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer conn.Close()
+
+	w.Header().Set("Content-Type", "audio/mpeg")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, canFlush := w.(http.Flusher)
+
+	buf := make([]byte, 8192)
+	for {
+		n, err := reader.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return // el oyente cerró la conexión (cambió de canción, cerró la pestaña...)
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return // el servidor de streaming cortó la conexión (dejaste de emitir)
+		}
+	}
+}
+
+// liveStatus hace una comprobación rápida (sin descargar audio) de si hay
+// alguien emitiendo ahora mismo, para que la interfaz pueda mostrar el
+// indicador de "en directo" sin tener que intentar reproducir a ciegas.
+func liveStatus(w http.ResponseWriter, r *http.Request) {
+	_, _, ok := liveStreamTarget()
+	live := false
+	if ok {
+		conn, _, err := dialLiveStream()
+		if err == nil {
+			live = true
+			conn.Close()
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"live": live})
+}
+
 func main() {
 	initS3()
 	initLovense()
+	initLiveConfig()
 
 	if s3Client != nil {
 		// Reconciliación inicial en segundo plano (no bloquea el arranque del
@@ -897,6 +1156,10 @@ func main() {
 	http.HandleFunc("/api/lovense/callback", enableCORS(lovenseCallback))
 	http.HandleFunc("/api/lovense/status", enableCORS(lovenseStatus))
 	http.HandleFunc("/api/lovense/vibrate", enableCORS(lovenseVibrate))
+	http.HandleFunc("/live", enableCORS(liveProxy))
+	http.HandleFunc("/api/live/status", enableCORS(liveStatus))
+	http.HandleFunc("/api/live/config", enableCORS(requireLiveAdmin(getLiveConfig)))
+	http.HandleFunc("/api/live/config/set", enableCORS(requireLiveAdmin(setLiveConfig)))
 	http.Handle("/", http.FileServer(http.Dir(".")))
 
 	port := os.Getenv("PORT")
