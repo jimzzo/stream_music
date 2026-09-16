@@ -276,11 +276,23 @@
     }
 
     .progress-bar {
-        background: linear-gradient(90deg, var(--accent-2), var(--accent));
+        background: linear-gradient(90deg, var(--accent-2), var(--accent), var(--accent-cyan), var(--accent));
+        background-size: 260% 100%;
         height: 100%;
         width: 0%;
         border-radius: 3px;
         position: relative;
+        transition: box-shadow 0.2s;
+        animation: progressShimmer 7s linear infinite;
+    }
+
+    @keyframes progressShimmer {
+        0%   { background-position: 0% 50%; }
+        100% { background-position: 260% 50%; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .progress-bar { animation: none; }
     }
 
     .progress-bar::after {
@@ -288,18 +300,20 @@
         position: absolute;
         right: -6px;
         top: 50%;
-        transform: translateY(-50%) scale(0);
+        transform: translateY(-50%) scale(0.65);
         width: 12px;
         height: 12px;
         background-color: #fff;
         border-radius: 50%;
-        transition: transform 0.15s;
+        opacity: 0.85;
+        transition: transform 0.15s, opacity 0.15s;
         box-shadow: 0 0 8px rgba(255, 46, 136, 0.7);
     }
 
     .progress-container:hover .progress-bar::after,
     .progress-container.dragging .progress-bar::after {
         transform: translateY(-50%) scale(1);
+        opacity: 1;
     }
 
     .time-info {
@@ -454,6 +468,26 @@
     .toy-switch.on::after {
         transform: translateX(16px);
         background: #fff;
+    }
+
+    .toy-switch.connecting {
+        background: var(--warm);
+        border-color: transparent;
+        animation: toySwitchPulse 1.4s ease-in-out infinite;
+    }
+
+    .toy-switch.connecting::after {
+        transform: translateX(8px);
+        background: #1a0f00;
+    }
+
+    @keyframes toySwitchPulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.55; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .toy-switch.connecting { animation: none; }
     }
 
     .toy-switch:disabled {
@@ -696,6 +730,7 @@
         let connected = false;
         let currentUid = null;
         let pollTimer = null;
+        let pollReject = null;
         let unsubscribeAudio = null;
         let lastSent = 0;
         let statusListener = () => {};
@@ -712,6 +747,7 @@
 
         function pollStatus(uid) {
             return new Promise((resolve, reject) => {
+                pollReject = reject;
                 const start = Date.now();
                 pollTimer = setInterval(async () => {
                     if (Date.now() - start > POLL_TIMEOUT_MS) {
@@ -731,6 +767,14 @@
             });
         }
 
+        function cancelConnect() {
+            clearInterval(pollTimer);
+            if (pollReject) {
+                pollReject(new Error('__CANCELLED__'));
+                pollReject = null;
+            }
+        }
+
         function sendVibrate(uid, level) {
             return fetch(`/api/lovense/vibrate?uid=${encodeURIComponent(uid)}&level=${level}`, { method: 'POST' });
         }
@@ -741,6 +785,7 @@
             onQrReady(qr);
 
             await pollStatus(uid); // solo confirma que ya se emparejó; los comandos van por nuestro servidor
+            pollReject = null;
             currentUid = uid;
             connected = true;
             statusListener('connected');
@@ -797,6 +842,7 @@
         return {
             connect,
             disconnect,
+            cancelConnect,
             attachToAudio,
             sendStop,
             setStatusListener,
@@ -1021,6 +1067,7 @@
     // en vez de dejar que se queden con el último valor "congelado".
     audioElement.addEventListener('pause', () => {
         drawRing(null);
+        updateProgressGlow(null);
         artContainer.style.boxShadow = '0 0 0 1px var(--border), 0 20px 45px rgba(0,0,0,0.55)';
         if (ToySync.connected) {
             ToySync.sendStop();
@@ -1114,8 +1161,19 @@
         toyLevel.classList.add('visible');
     });
 
+    let toyConnecting = false;
+
     toySwitch.onclick = async () => {
         if (toySwitch.disabled) return;
+
+        // Ya está esperando el escaneo: este clic cancela en vez de reintentar.
+        if (toyConnecting) {
+            ToySync.cancelConnect();
+            toyConnecting = false;
+            toySwitch.classList.remove('connecting');
+            showToyNote('Cancelado.', 2500);
+            return;
+        }
 
         if (toySyncEnabled) {
             toySwitch.disabled = true;
@@ -1128,25 +1186,30 @@
             return;
         }
 
-        toySwitch.disabled = true;
+        toyConnecting = true;
+        toySwitch.classList.add('connecting');
         try {
             await ToySync.connect((qrUrl) => {
                 showToyNote(
                     `Escanea este código con la app <strong>Lovense Remote</strong>:<br>` +
-                    `<img src="${escapeHtml(qrUrl)}" alt="Código QR de Lovense" style="width:150px;height:150px;margin-top:8px;border-radius:8px;display:block;">`
+                    `<img src="${escapeHtml(qrUrl)}" alt="Código QR de Lovense" style="width:150px;height:150px;margin-top:8px;border-radius:8px;display:block;">` +
+                    `<span style="opacity:.65">Pulsa el interruptor otra vez para cancelar.</span>`
                 );
             });
+            toyConnecting = false;
+            toySwitch.classList.remove('connecting');
             ToySync.attachToAudio();
             toySyncEnabled = true;
             toySwitch.classList.add('on');
             toySwitch.setAttribute('aria-checked', 'true');
             showToyNote('¡Conectado! Ya vibra al ritmo de los graves de la sesión.', 6000);
         } catch (err) {
+            toyConnecting = false;
+            toySwitch.classList.remove('connecting');
+            if (err && err.message === '__CANCELLED__') return; // el usuario ya lo canceló, no hace falta avisar de error
             console.error('ToySync:', err);
             const detail = (err && err.message) ? err.message : String(err);
             showToyNote(`No se pudo conectar con Lovense.<br><span style="opacity:.65">${escapeHtml(detail)}</span>`);
-        } finally {
-            toySwitch.disabled = false;
         }
     };
 
@@ -1201,6 +1264,20 @@
     }
 
     AudioEngine.subscribe(drawRing);
+
+    // La barra de progreso también respira con los graves — mismo análisis
+    // de audio que ya usa el anillo, sin montar nada nuevo.
+    function updateProgressGlow(dataArray) {
+        if (!dataArray) {
+            progressBar.style.boxShadow = 'none';
+            return;
+        }
+        let bassSum = 0;
+        for (let i = 0; i < 6; i++) bassSum += dataArray[i];
+        const bass = bassSum / (6 * 255);
+        progressBar.style.boxShadow = `0 0 ${6 + bass * 16}px rgba(255, 46, 136, ${0.25 + bass * 0.45})`;
+    }
+    AudioEngine.subscribe(updateProgressGlow);
 
     loadSongs();
 </script>
