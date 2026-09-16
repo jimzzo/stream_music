@@ -1324,6 +1324,7 @@ func fetchShoutcastStats(host string) (*shoutcastStats, error) {
 func liveStatus(w http.ResponseWriter, r *http.Request) {
 	host, _, ok := liveStreamTarget()
 	live := false
+	songTitle := ""
 	debug := ""
 
 	if ok {
@@ -1333,6 +1334,7 @@ func liveStatus(w http.ResponseWriter, r *http.Request) {
 			// conectado, 1 = fuente en vivo conectada (sin AutoDJ, así que
 			// no hay estado intermedio que confundir).
 			live = stats.StreamStatus > 0
+			songTitle = stats.SongTitle
 			debug = fmt.Sprintf("streamstatus=%d currentlisteners=%d songtitle=%q", stats.StreamStatus, stats.CurrentListeners, stats.SongTitle)
 		} else {
 			conn, _, _, _, cerr := dialLiveStream()
@@ -1345,7 +1347,7 @@ func liveStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"live": live, "debug": debug})
+	json.NewEncoder(w).Encode(map[string]interface{}{"live": live, "songtitle": songTitle, "debug": debug})
 }
 
 func main() {
