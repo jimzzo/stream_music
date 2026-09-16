@@ -1276,7 +1276,21 @@
         nextBtn.click();
     };
 
+    const MEDIA_ERROR_NAMES = {
+        1: 'MEDIA_ERR_ABORTED',
+        2: 'MEDIA_ERR_NETWORK',
+        3: 'MEDIA_ERR_DECODE',
+        4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
+    };
+
     audioElement.addEventListener('error', () => {
+        const err = audioElement.error;
+        console.error(
+            'audioElement error — código:', err ? err.code : '(sin error object)',
+            '(' + (err && MEDIA_ERROR_NAMES[err.code] || 'desconocido') + ')',
+            '| mensaje:', err ? err.message : '(vacío)',
+            '| isLiveMode:', isLiveMode
+        );
         if (isLiveMode) {
             exitLiveMode();
             songTitleEl.innerText = 'Se perdió la conexión con el directo';
@@ -1319,6 +1333,7 @@
             const res = await fetch('/api/live/status');
             const data = await res.json();
             liveAvailable = !!data.live;
+            if (data.debug) console.log('live status debug:', data.debug);
         } catch (e) {
             liveAvailable = false;
         }
