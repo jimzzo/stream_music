@@ -604,20 +604,26 @@
         let rafId = null;
         let failed = false;
         let failListener = () => {};
+        let mediaEl = null;
 
         function ensureContext(audioElement) {
-            if (audioCtx || failed) return;
+            mediaEl = audioElement;
+            if (audioCtx || failed) { console.log('AudioEngine[debug]: ya estaba inicializado (o falló antes), no reintento'); return; }
             const Ctx = window.AudioContext || window.webkitAudioContext;
-            if (!Ctx) { failed = true; failListener('no-web-audio'); return; }
+            if (!Ctx) { failed = true; console.log('AudioEngine[debug]: este navegador no expone AudioContext'); failListener('no-web-audio'); return; }
 
+            console.log('AudioEngine[debug]: creando AudioContext…');
             try {
                 const ctx = new Ctx();
+                console.log('AudioEngine[debug]: AudioContext creado, estado =', ctx.state, 'sampleRate =', ctx.sampleRate);
                 const source = ctx.createMediaElementSource(audioElement);
+                console.log('AudioEngine[debug]: MediaElementSource creado');
                 const an = ctx.createAnalyser();
                 an.fftSize = 256;
                 an.smoothingTimeConstant = 0.75;
                 source.connect(an);
                 an.connect(ctx.destination);
+                console.log('AudioEngine[debug]: analizador conectado, arrancando el bucle de lectura');
 
                 audioCtx = ctx;
                 analyser = an;
@@ -633,13 +639,27 @@
         }
 
         function resume() {
-            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+            if (audioCtx && audioCtx.state === 'suspended') {
+                console.log('AudioEngine[debug]: contexto suspendido, llamando a resume()');
+                audioCtx.resume().then(() => console.log('AudioEngine[debug]: resume() OK, estado =', audioCtx.state));
+            }
         }
 
+        let debugCounter = 0;
         function loop() {
             rafId = requestAnimationFrame(loop);
             if (!analyser) return;
+
+            // Con la música en pausa no hay audio nuevo que analizar: no
+            // llamamos a los suscriptores (visualizador, sincronización de
+            // juguete) para que no se queden repitiendo el último valor.
+            if (mediaEl && mediaEl.paused) return;
+
             analyser.getByteFrequencyData(dataArray);
+            if (debugCounter++ % 120 === 0) { // ~cada 2 segundos a 60fps
+                const max = Math.max(...dataArray);
+                console.log('AudioEngine[debug]: contextState =', audioCtx.state, '| pico de frecuencia =', max, '| suscriptores =', listeners.length);
+            }
             listeners.forEach(fn => fn(dataArray));
         }
 
@@ -759,6 +779,13 @@
             }
         }
 
+        function sendStop() {
+            if (!connected || !currentUid) return;
+            lastSent = performance.now(); // evita que el próximo golpe de graves lo pise enseguida
+            levelListener(0);
+            sendVibrate(currentUid, 0).catch(() => {});
+        }
+
         function setStatusListener(fn) { statusListener = fn; }
         function setLevelListener(fn) { levelListener = fn; }
 
@@ -766,6 +793,7 @@
             connect,
             disconnect,
             attachToAudio,
+            sendStop,
             setStatusListener,
             setLevelListener,
             get connected() { return connected; },
@@ -975,6 +1003,16 @@
     };
 
     audioElement.onended = () => nextBtn.click();
+
+    // Al pausar, limpiamos el visualizador y paramos el juguete de inmediato
+    // en vez de dejar que se queden con el último valor "congelado".
+    audioElement.addEventListener('pause', () => {
+        drawRing(null);
+        artContainer.style.boxShadow = '0 0 0 1px var(--border), 0 20px 45px rgba(0,0,0,0.55)';
+        if (ToySync.connected) {
+            ToySync.sendStop();
+        }
+    });
 
     volumeSlider.oninput = (e) => {
         audioElement.volume = e.target.value;
