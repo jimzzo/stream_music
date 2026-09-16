@@ -1391,9 +1391,9 @@
             return;
         }
         if (!liveAvailable) {
-            const original = liveLabel.textContent;
+            clearTimeout(liveLabel._resetTimer);
             liveLabel.textContent = 'Nadie emitiendo ahora';
-            setTimeout(() => { liveLabel.textContent = original; }, 2500);
+            liveLabel._resetTimer = setTimeout(() => { liveLabel.textContent = 'En directo'; }, 2500);
             return;
         }
         enterLiveMode();
