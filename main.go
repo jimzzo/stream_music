@@ -1052,7 +1052,12 @@ func dialLiveStreamOnce(host, path string) (conn net.Conn, reader *bufio.Reader,
 		return nil, nil, 0, "", 0, "", err
 	}
 
-	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nIcy-MetaData: 0\r\nConnection: close\r\n\r\n", path, host)
+	// OJO: el User-Agent NUNCA debe empezar por "Mozilla" aquí. Los
+	// servidores Shoutcast clásicos detectan esa palabra y, pensando que
+	// hablan con un navegador, devuelven su página de estadísticas en
+	// HTML en vez del audio — es justo el comportamiento documentado que
+	// nos rompía esto. Un nombre de reproductor cualquiera evita ese caso.
+	req := fmt.Sprintf("GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: ReproductorSesiones/1.0\r\nIcy-MetaData: 0\r\nConnection: close\r\n\r\n", path, host)
 	if _, err = conn.Write([]byte(req)); err != nil {
 		conn.Close()
 		return nil, nil, 0, "", 0, "", err
