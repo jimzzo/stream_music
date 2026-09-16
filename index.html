@@ -831,7 +831,7 @@
 
     let previousVolume = 1;
     let toySyncEnabled = false;
-    const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
 
     async function loadSongs() {
         try {
@@ -1144,7 +1144,7 @@
     function drawRing(dataArray) {
         const w = ringCanvas.width, h = ringCanvas.height;
         ringCtx.clearRect(0, 0, w, h);
-        if (!dataArray || prefersReducedMotion) return;
+        if (!dataArray || reducedMotionQuery.matches) return;
 
         const cx = w / 2, cy = h / 2;
         const baseRadius = 112;
