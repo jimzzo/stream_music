@@ -180,8 +180,8 @@
 
     .art-stage {
         position: relative;
-        width: 260px;
-        height: 260px;
+        width: 320px;
+        height: 320px;
         margin: 0 auto 28px auto;
     }
 
@@ -194,11 +194,11 @@
 
     .album-art-container {
         position: absolute;
-        top: 25px;
-        left: 25px;
-        width: 210px;
-        height: 210px;
-        border-radius: 18px;
+        top: 45px;
+        left: 45px;
+        width: 230px;
+        height: 230px;
+        border-radius: 50%;
         overflow: hidden;
         background-color: #161022;
         box-shadow: 0 0 0 1px var(--border), 0 20px 45px rgba(0, 0, 0, 0.55);
@@ -378,6 +378,11 @@
 
     .volume-container .btn {
         font-size: 1rem;
+        width: 20px;
+        flex-shrink: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
     }
 
     .volume-slider {
@@ -540,7 +545,7 @@
     <div class="stage">
 
         <div class="art-stage">
-            <canvas id="ring-canvas" width="260" height="260"></canvas>
+            <canvas id="ring-canvas" width="320" height="320"></canvas>
             <div id="art-container" class="album-art-container">
                 <i id="art-placeholder" class="fa-solid fa-compact-disc album-art-placeholder"></i>
                 <img id="album-art" alt="Carátula">
@@ -832,6 +837,14 @@
     let previousVolume = 1;
     let toySyncEnabled = false;
     const reducedMotionQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+    // Algunos navegadores restauran el valor del control deslizante de volumen
+    // al recargar la página (aunque el <audio> no se acuerde de nada), así que
+    // sincronizamos el volumen real con lo que el slider esté mostrando ahora
+    // mismo — si no, el audio suena al 100% aunque la barra parezca baja.
+    audioElement.volume = parseFloat(volumeSlider.value) || 1;
+    previousVolume = audioElement.volume || 1;
+    updateVolumeIcon(audioElement.volume);
 
     async function loadSongs() {
         try {
@@ -1147,14 +1160,14 @@
         if (!dataArray || reducedMotionQuery.matches) return;
 
         const cx = w / 2, cy = h / 2;
-        const baseRadius = 112;
-        const barCount = 56;
+        const baseRadius = 124; // justo fuera del borde de la carátula (radio 115) con margen
+        const barCount = 64;
         const step = Math.floor(dataArray.length / barCount) || 1;
 
         for (let i = 0; i < barCount; i++) {
             const value = dataArray[i * step] / 255;
             const angle = (i / barCount) * Math.PI * 2 - Math.PI / 2;
-            const barLength = 4 + value * 40;
+            const barLength = 4 + value * 26; // alcance máximo 150, por debajo del borde del lienzo (160)
             const x1 = cx + Math.cos(angle) * baseRadius;
             const y1 = cy + Math.sin(angle) * baseRadius;
             const x2 = cx + Math.cos(angle) * (baseRadius + barLength);
