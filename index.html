@@ -774,6 +774,8 @@
         <input id="live-host-input" class="live-settings-input" type="text" placeholder="srv1.goodsoundstream.com:3011" autocomplete="off">
         <label class="live-settings-label" for="live-path-input">Ruta</label>
         <input id="live-path-input" class="live-settings-input" type="text" placeholder="/" autocomplete="off">
+        <label class="live-settings-label" for="live-url-input">URL pública HTTPS para escuchar (opcional)</label>
+        <input id="live-url-input" class="live-settings-input" type="text" placeholder="https://srv1.goodsoundstream.com/proxy/usuario/stream" autocomplete="off">
         <div class="live-settings-actions">
             <button id="live-settings-save" class="live-settings-save" type="button">Guardar</button>
             <span id="live-settings-msg" class="live-settings-msg"></span>
@@ -837,7 +839,7 @@
     </div>
 </div>
 
-<audio id="audio-element"></audio>
+<audio id="audio-element" crossorigin="anonymous"></audio>
 
 <script>
     // ---------------------------------------------------------------
@@ -1098,6 +1100,7 @@
     const liveSettingsPanel = document.getElementById('live-settings-panel');
     const liveHostInput = document.getElementById('live-host-input');
     const livePathInput = document.getElementById('live-path-input');
+    const liveUrlInput = document.getElementById('live-url-input');
     const liveSettingsSave = document.getElementById('live-settings-save');
     const liveSettingsMsg = document.getElementById('live-settings-msg');
 
@@ -1299,6 +1302,7 @@
 
     let isLiveMode = false;
     let liveAvailable = false;
+    let liveStreamURL = ''; // URL HTTPS directa (si el proveedor la da) — evita pasar por Render
 
     function showToast(text, duration = 4000) {
         toast.textContent = text;
@@ -1351,7 +1355,7 @@
         artPlaceholder.style.display = 'block';
         updateActiveItem();
 
-        audioElement.src = '/live';
+        audioElement.src = liveStreamURL || '/live';
         AudioEngine.ensureContext(audioElement);
         AudioEngine.resume();
         audioElement.play().then(() => {
@@ -1377,6 +1381,7 @@
             const res = await fetch('/api/live/status');
             const data = await res.json();
             liveAvailable = !!data.live;
+            liveStreamURL = data.url || '';
             if (data.debug) console.log('live status debug:', data.debug);
             if (isLiveMode) {
                 songArtistEl.innerText = (data.songtitle && data.songtitle.trim())
@@ -1417,6 +1422,7 @@
             const cfg = await res.json();
             liveHostInput.value = cfg.host || '';
             livePathInput.value = cfg.path || '/';
+            liveUrlInput.value = cfg.publicUrl || '';
         } catch (e) { /* si falla, se queda con los placeholders */ }
     }
 
@@ -1428,8 +1434,13 @@
     liveSettingsSave.onclick = async () => {
         const host = liveHostInput.value.trim();
         const path = livePathInput.value.trim() || '/';
+        const publicUrl = liveUrlInput.value.trim();
         if (!host) {
             liveSettingsMsg.textContent = 'Falta el servidor.';
+            return;
+        }
+        if (publicUrl && !publicUrl.startsWith('https://')) {
+            liveSettingsMsg.textContent = 'La URL pública debe empezar por https://';
             return;
         }
         liveSettingsSave.disabled = true;
@@ -1438,7 +1449,7 @@
             const res = await fetch('/api/live/config/set', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ host, path }),
+                body: JSON.stringify({ host, path, publicUrl }),
             });
             if (!res.ok) throw new Error(await res.text());
             liveSettingsMsg.textContent = 'Guardado.';
