@@ -1181,12 +1181,17 @@
             songTitleEl.classList.remove('marquee');
         }
 
-        audioElement.src = `/play?song=${encodeURIComponent(song.nombre)}`;
+        // Reproducción directa desde R2 (URL firmada) — no pasa por Render.
+        // Si por lo que sea no viniera (no debería pasar), caemos al proxy
+        // viejo en vez de dejar la canción muda.
+        audioElement.src = song.audioUrl || `/play?song=${encodeURIComponent(song.nombre)}`;
         updateActiveItem();
 
         albumArtImg.style.display = 'none';
         artPlaceholder.style.display = 'block';
-        albumArtImg.src = `/cover?song=${encodeURIComponent(song.nombre)}`;
+        // Igual que el audio: carátula directa desde R2 si ya está indexada;
+        // si no, el proxy viejo la extrae al vuelo como hacía antes.
+        albumArtImg.src = song.coverUrl || `/cover?song=${encodeURIComponent(song.nombre)}`;
 
         albumArtImg.onload = () => {
             albumArtImg.style.display = 'block';
