@@ -853,8 +853,10 @@
         let audioCtx = null;
         let analyser = null;
         let dataArray = null;
-        let listeners = [];
+        let listeners = [];           // consumidores visuales — se pausan en segundo plano, correcto (nada que dibujar)
+        let backgroundListeners = []; // consumidores no visuales (p.ej. el juguete) — siguen en segundo plano
         let rafId = null;
+        let backgroundTimer = null;
         let failed = false;
         let failListener = () => {};
         let mediaEl = null;
@@ -876,12 +878,13 @@
                 an.smoothingTimeConstant = 0.75;
                 source.connect(an);
                 an.connect(ctx.destination);
-                console.log('AudioEngine[debug]: analizador conectado, arrancando el bucle de lectura');
+                console.log('AudioEngine[debug]: analizador conectado, arrancando los bucles de lectura');
 
                 audioCtx = ctx;
                 analyser = an;
                 dataArray = new Uint8Array(analyser.frequencyBinCount);
                 loop();
+                startBackgroundLoop();
             } catch (err) {
                 console.error('AudioEngine: no se pudo montar el analizador de audio:', err);
                 audioCtx = null;
@@ -898,15 +901,14 @@
             }
         }
 
+        function readyToSample() {
+            return analyser && !(mediaEl && mediaEl.paused);
+        }
+
         let debugCounter = 0;
         function loop() {
             rafId = requestAnimationFrame(loop);
-            if (!analyser) return;
-
-            // Con la música en pausa no hay audio nuevo que analizar: no
-            // llamamos a los suscriptores (visualizador, sincronización de
-            // juguete) para que no se queden repitiendo el último valor.
-            if (mediaEl && mediaEl.paused) return;
+            if (!readyToSample()) return;
 
             analyser.getByteFrequencyData(dataArray);
             if (debugCounter++ % 120 === 0) { // ~cada 2 segundos a 60fps
@@ -916,14 +918,33 @@
             listeners.forEach(fn => fn(dataArray));
         }
 
+        // Bucle aparte, con setInterval en vez de requestAnimationFrame,
+        // específicamente para quien necesite seguir recibiendo datos aunque
+        // la pestaña esté minimizada o en segundo plano (el juguete, sobre
+        // todo) — requestAnimationFrame se pausa del todo ahí, setInterval
+        // como mucho se ralentiza, pero no se detiene.
+        function startBackgroundLoop() {
+            if (backgroundTimer) return;
+            backgroundTimer = setInterval(() => {
+                if (!readyToSample() || backgroundListeners.length === 0) return;
+                analyser.getByteFrequencyData(dataArray);
+                backgroundListeners.forEach(fn => fn(dataArray));
+            }, 250);
+        }
+
         function subscribe(fn) {
             listeners.push(fn);
             return () => { listeners = listeners.filter(l => l !== fn); };
         }
 
+        function subscribeBackground(fn) {
+            backgroundListeners.push(fn);
+            return () => { backgroundListeners = backgroundListeners.filter(l => l !== fn); };
+        }
+
         function onFail(fn) { failListener = fn; }
 
-        return { ensureContext, resume, subscribe, onFail };
+        return { ensureContext, resume, subscribe, subscribeBackground, onFail };
     })();
 
     // ---------------------------------------------------------------
@@ -1033,7 +1054,7 @@
 
         function attachToAudio() {
             if (unsubscribeAudio) return;
-            unsubscribeAudio = AudioEngine.subscribe(feed);
+            unsubscribeAudio = AudioEngine.subscribeBackground(feed);
         }
 
         function detachFromAudio() {
