@@ -925,6 +925,15 @@ const liveConfigKey = "_manifest/live-config.json"
 type LiveConfig struct {
 	Host string `json:"host"`
 	Path string `json:"path"`
+	// PublicURL, cuando está configurada, es una URL HTTPS que el propio
+	// proveedor de streaming expone (con CORS activado) y a la que el
+	// NAVEGADOR se conecta directamente para escuchar el directo — sin
+	// pasar por este servidor. Esto evita que el audio en directo cuente
+	// contra el ancho de banda de Render. Host/Path se siguen usando para
+	// las comprobaciones de estado (streamstatus), que sí necesitan pasar
+	// por aquí porque usan trucos de bajo nivel que un navegador no puede
+	// hacer.
+	PublicURL string `json:"publicUrl"`
 }
 
 var (
@@ -1006,6 +1015,7 @@ func setLiveConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	cfg.Host = strings.TrimSpace(cfg.Host)
 	cfg.Path = strings.TrimSpace(cfg.Path)
+	cfg.PublicURL = strings.TrimSpace(cfg.PublicURL)
 	if cfg.Host == "" {
 		http.Error(w, "falta el host del servidor de streaming", http.StatusBadRequest)
 		return
@@ -1015,6 +1025,10 @@ func setLiveConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if !strings.HasPrefix(cfg.Path, "/") {
 		cfg.Path = "/" + cfg.Path
+	}
+	if cfg.PublicURL != "" && !strings.HasPrefix(cfg.PublicURL, "https://") {
+		http.Error(w, "la URL pública tiene que empezar por https:// (si no, el navegador la bloqueará al venir de una página https)", http.StatusBadRequest)
+		return
 	}
 
 	liveConfigMutex.Lock()
@@ -1347,7 +1361,10 @@ func liveStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"live": live, "songtitle": songTitle, "debug": debug})
+	liveConfigMutex.Lock()
+	publicURL := liveConfig.PublicURL
+	liveConfigMutex.Unlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{"live": live, "songtitle": songTitle, "url": publicURL, "debug": debug})
 }
 
 func main() {
