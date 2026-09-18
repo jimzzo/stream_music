@@ -528,6 +528,39 @@ func reconcileLibrary(ctx context.Context) {
 	}
 }
 
+// La duración de las URLs firmadas: bastante larga para que una sesión de
+// escucha entera no se corte a mitad, corta para que un enlace suelto no
+// funcione para siempre si se comparte fuera de la web.
+const signedURLExpiry = 6 * time.Hour
+
+// presignGet firma una URL de descarga directa a R2 para el objeto indicado,
+// válida durante signedURLExpiry. Es una operación puramente criptográfica
+// local (no toca la red), así que generar una por canción en cada petición
+// a /songs es barato incluso con una librería grande.
+func presignGet(ctx context.Context, key string) (string, error) {
+	presignClient := s3.NewPresignClient(s3Client)
+	req, err := presignClient.PresignGetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(bucketName),
+		Key:    aws.String(key),
+	}, s3.WithPresignExpires(signedURLExpiry))
+	if err != nil {
+		return "", err
+	}
+	return req.URL, nil
+}
+
+// SongOut es lo que de verdad viaja al navegador: añade a los metadatos de
+// Song las URLs firmadas de R2, para que el audio y la carátula se
+// descarguen directos desde R2 (gratis, sin tocar el ancho de banda de
+// Render) en vez de pasar por /play y /cover.
+type SongOut struct {
+	Nombre   string `json:"nombre"`
+	Titulo   string `json:"titulo"`
+	Artista  string `json:"artista"`
+	AudioURL string `json:"audioUrl"`
+	CoverURL string `json:"coverUrl,omitempty"`
+}
+
 func getSongs(w http.ResponseWriter, r *http.Request) {
 	if s3Client == nil {
 		http.Error(w, "Cloud storage no configurado", http.StatusInternalServerError)
@@ -549,10 +582,42 @@ func getSongs(w http.ResponseWriter, r *http.Request) {
 	songs := cachedSongs
 	cacheMutex.Unlock()
 
+	manifestMutex.Lock()
+	manifestSnapshot := make(map[string]ManifestEntry, len(manifestCache))
+	for k, v := range manifestCache {
+		manifestSnapshot[k] = v
+	}
+	manifestMutex.Unlock()
+
+	out := make([]SongOut, 0, len(songs))
+	for _, s := range songs {
+		audioURL, err := presignGet(r.Context(), s.Nombre)
+		if err != nil {
+			log.Println("No se pudo firmar la URL de", s.Nombre, ":", err)
+			continue // mejor omitir esta canción que romper toda la lista
+		}
+		coverURL := ""
+		if entry, ok := manifestSnapshot[s.Nombre]; ok && entry.CoverKey != "" {
+			if u, cerr := presignGet(r.Context(), entry.CoverKey); cerr == nil {
+				coverURL = u
+			}
+		}
+		out = append(out, SongOut{
+			Nombre:   s.Nombre,
+			Titulo:   s.Titulo,
+			Artista:  s.Artista,
+			AudioURL: audioURL,
+			CoverURL: coverURL,
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(songs)
+	json.NewEncoder(w).Encode(out)
 }
 
+// playSong y getCover se dejan tal cual, sin usarse ya desde la web (que
+// ahora reproduce directo desde R2) — quedan como vía de emergencia por si
+// hay que volver atrás rápido sin tocar el backend.
 func playSong(w http.ResponseWriter, r *http.Request) {
 	songName := r.URL.Query().Get("song")
 	if s3Client == nil {
